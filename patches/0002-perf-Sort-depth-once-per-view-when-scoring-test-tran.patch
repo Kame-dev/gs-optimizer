@@ -1,0 +1,137 @@
+From 5c20d73893c84e3395d3f62a6eee3b042b5be0bf Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 12:17:21 +0000
+Subject: [PATCH 2/3] perf: Sort depth once per view when scoring; test
+ transform and groups
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RfkFS6mjG8zdavwCoa7Kk9
+---
+ src/lib/gpu/gpu-scene-rasterizer.ts |  6 ++-
+ test/view-score.test.mjs            | 65 ++++++++++++++++++++++++++++-
+ 2 files changed, 68 insertions(+), 3 deletions(-)
+
+diff --git a/src/lib/gpu/gpu-scene-rasterizer.ts b/src/lib/gpu/gpu-scene-rasterizer.ts
+index deecf4a..1046c77 100644
+--- a/src/lib/gpu/gpu-scene-rasterizer.ts
++++ b/src/lib/gpu/gpu-scene-rasterizer.ts
+@@ -631,6 +631,11 @@ class GpuSceneRasterizer {
+         this.scoring = true;
+         try {
+             for (const view of views) {
++                // The depth order depends on the camera alone: sort once per
++                // view and reuse it for every group (the tile sort has its
++                // own sorter, so the order survives the groups' passes).
++                this.setUniforms(view, 0, 0, o.groupTilesX, o.groupTilesY, 0, 1);
++                this.depthSortPass();
+                 for (let gy = 0; gy < numGroupsY; gy++) {
+                     for (let gx = 0; gx < numGroupsX; gx++) {
+                         const tilesX = Math.min(o.groupTilesX, imageTilesX - gx * o.groupTilesX);
+@@ -639,7 +644,6 @@ class GpuSceneRasterizer {
+                         const groupPixels = tilesX * tilesY * TILE_SIZE * TILE_SIZE;
+                         this.clearStateCompute.setupDispatch(Math.ceil(groupPixels / (4 * 256)), 1, 1);
+                         this.device.computeDispatch([this.clearStateCompute], 'scene-clear-state');
+-                        this.depthSortPass();
+                         await this.rasterRange(this.numSplats, tilesX, tilesY);
+                         // Fold the group's counters into the totals through this view's
+                         // order; per group, so a counter never spans more than one group.
+diff --git a/test/view-score.test.mjs b/test/view-score.test.mjs
+index 95b25ee..1f33a31 100644
+--- a/test/view-score.test.mjs
++++ b/test/view-score.test.mjs
+@@ -32,9 +32,11 @@ const logit = p => Math.log(p / (1 - p));
+  * plane z = 0; groups of small gaussians sit in front of it (z = 2), behind
+  * it (z = -2), behind the camera (z = 9) and far off to the side (x = 60).
+  *
++ * @param {object} [transform] - Pending transform of the source; the stored
++ * positions are moved through its inverse, so the scene looks the same.
+  * @returns {Promise<object>} The scene and the row ranges of its groups.
+  */
+-const makeScene = async () => {
++const makeScene = async (transform) => {
+     const { Column, DataTable, dataTableToChunkSource } = await import('../src/lib/index.js');
+     const { createChunkDataPool } = await import('../src/lib/chunk/index.js');
+     const rows = [];
+@@ -59,6 +61,17 @@ const makeScene = async () => {
+     group('outside', cluster(2, 60));
+ 
+     const n = rows.length;
++    if (transform) {
++        const { Vec3 } = await import('playcanvas');
++        const inverse = transform.clone().invert();
++        const v = new Vec3();
++        for (const r of rows) {
++            inverse.transformPoint(v.set(r.x, r.y, r.z), v);
++            r.x = v.x;
++            r.y = v.y;
++            r.z = v.z;
++        }
++    }
+     const col = fn => Float32Array.from(rows, fn);
+     const one = new Float32Array(n).fill(1);
+     const zero = new Float32Array(n);
+@@ -68,7 +81,7 @@ const makeScene = async () => {
+         new Column('scale_0', col(r => r.logScale)), new Column('scale_1', col(r => r.logScale)), new Column('scale_2', col(r => r.logScale)),
+         new Column('opacity', col(r => logit(r.alpha))),
+         new Column('f_dc_0', one), new Column('f_dc_1', one), new Column('f_dc_2', one)
+-    ]);
++    ], transform);
+     const chunkSize = 1024;
+     return {
+         source: dataTableToChunkSource(dataTable, chunkSize),
+@@ -144,4 +157,52 @@ describe('computeViewScores', () => {
+         }
+         for (let i = 0; i < scene.n; i++) assert.ok(two.max[i] <= two.sum[i] + 1e-3);
+     });
++
++    it('honours the source transform', async (t) => {
++        if (!device) return t.skip('no WebGPU device');
++        const { computeViewScores, Transform } = await import('../src/lib/index.js');
++        // Isotropic gaussians, so only the positions need the inverse transform.
++        const plain = await makeScene();
++        const moved = await makeScene(Transform.PLY);
++        const a = await computeViewScores(device, plain.source, plain.pool, [camera], size);
++        const b = await computeViewScores(device, moved.source, moved.pool, [camera], size);
++        for (let i = 0; i < plain.n; i++) {
++            assert.ok(Math.abs(a.sum[i] - b.sum[i]) <= 0.01 + 0.01 * a.sum[i], `row ${i}: ${a.sum[i]} vs ${b.sum[i]}`);
++        }
++        assert.ok(range(b.sum, moved.groups.hidden).every(s => s === 0));
++    });
++
++    it('scores the same across image groups', async (t) => {
++        if (!device) return t.skip('no WebGPU device');
++        const { GpuSceneRasterizer } = await import('../src/lib/gpu/gpu-scene-rasterizer.js');
++        const { buildCameraBasis } = await import('../src/lib/render/index.js');
++        const { Vec3 } = await import('playcanvas');
++        const scene = await makeScene();
++        const view = {
++            basis: buildCameraBasis({
++                position: new Vec3(0, 0, 6), target: new Vec3(0, 0, 0), up: new Vec3(0, 1, 0),
++                fovY: 60 * Math.PI / 180, ...size, near: 0.2
++            }),
++            near: 0.2,
++            focusDistance: 0,
++            apertureScale: 0
++        };
++        // The 20 × 12 tile image as one group, and as a 3 × 3 grid of groups.
++        const score = async (groupTilesX, groupTilesY) => {
++            const raster = new GpuSceneRasterizer(device, {
++                numSHBands: 0, projection: 'pinhole', imageWidth: size.width, imageHeight: size.height,
++                groupTilesX, groupTilesY, bgR: 0, bgG: 0, bgB: 0, bgA: 0, scoreScale: 4096
++            });
++            await raster.uploadScene(scene.source, scene.pool);
++            await raster.score([view]);
++            const totals = await raster.readScores();
++            raster.destroy();
++            return totals;
++        };
++        const whole = await score(20, 12);
++        const split = await score(8, 5);
++        for (let i = 0; i < scene.n; i++) {
++            assert.ok(Math.abs(whole[i * 2] - split[i * 2]) <= 0.01 + 0.01 * whole[i * 2], `row ${i}: ${whole[i * 2]} vs ${split[i * 2]}`);
++        }
++    });
+ });
+-- 
+2.43.0
+

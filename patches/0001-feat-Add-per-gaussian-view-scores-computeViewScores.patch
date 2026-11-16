@@ -1,0 +1,717 @@
+From 8af986f94c0ba72155005e5dae45e2583c10a84c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 12:07:14 +0000
+Subject: [PATCH 1/3] feat: Add per-gaussian view scores (computeViewScores)
+
+Score every gaussian by its contribution to a set of views: the sum over
+pixels of its blending weight, accumulated in the scene rasterizer and
+resolved to source rows on the GPU. Resident tier only.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RfkFS6mjG8zdavwCoa7Kk9
+---
+ src/lib/gpu/gpu-scene-rasterizer.ts     | 118 ++++++++++++++++++-
+ src/lib/gpu/shaders/rasterize-binned.ts |  11 +-
+ src/lib/gpu/shaders/score-resolve.ts    |  37 ++++++
+ src/lib/index.ts                        |   2 +
+ src/lib/render/index.ts                 |   1 +
+ src/lib/render/scene-renderer.ts        |  49 +++++++-
+ src/lib/render/view-score.ts            | 140 ++++++++++++++++++++++
+ test/view-score.test.mjs                | 147 ++++++++++++++++++++++++
+ 8 files changed, 495 insertions(+), 10 deletions(-)
+ create mode 100644 src/lib/gpu/shaders/score-resolve.ts
+ create mode 100644 src/lib/render/view-score.ts
+ create mode 100644 test/view-score.test.mjs
+
+diff --git a/src/lib/gpu/gpu-scene-rasterizer.ts b/src/lib/gpu/gpu-scene-rasterizer.ts
+index 5111437..deecf4a 100644
+--- a/src/lib/gpu/gpu-scene-rasterizer.ts
++++ b/src/lib/gpu/gpu-scene-rasterizer.ts
+@@ -51,6 +51,7 @@ import { initTileOffsetsWgsl } from './shaders/init-tile-offsets';
+ import { projectWgsl } from './shaders/project';
+ import { rasterizeBinnedWgsl } from './shaders/rasterize-binned';
+ import { SCAN_BLOCK, scanBlocksWgsl, scanSumsWgsl } from './shaders/scan-blocks';
++import { scoreResolveWgsl } from './shaders/score-resolve';
+ import { tileBinEmitPairsWgsl } from './shaders/tile-bin-emit-pairs';
+ import { uniformsStruct, uniformFormatEntries } from './shaders/uniforms';
+ 
+@@ -117,6 +118,12 @@ type SceneRasterizerOptions = {
+     bgG: number;
+     bgB: number;
+     bgA: number;
++    /**
++     * Enables {@link GpuSceneRasterizer.score}: the fixed-point scale of the
++     * per-gaussian contribution counters. A counter is a u32 summed over one
++     * group's pixels, so `scoreScale × group pixels` must stay below 2³².
++     */
++    scoreScale?: number;
+ };
+ 
+ /**
+@@ -232,6 +239,14 @@ class GpuSceneRasterizer {
+     private finalizeCompute: Compute;
+     /** Slice accumulation, in place of finalize for multi-view frames. */
+     private accumulateCompute: Compute;
++    /** Scoring only: the rasterizer that counts contributions, and the pass folding them into the totals. */
++    private scoreRasterizeCompute: Compute | null = null;
++    private scoreResolveCompute: Compute | null = null;
++    /** Scoring only: per-rank counters of one pass, and per-row (sum, max) totals. */
++    private scoreBuffer: StorageBuffer | null = null;
++    private scoreTotalsBuffer: StorageBuffer | null = null;
++    /** True while `score` runs: cuts rasterize through the counting shader. */
++    private scoring = false;
+ 
+     // Scene (set by the upload methods).
+     /** Gaussians in the scene: the depth sort's extent. */
+@@ -411,6 +426,21 @@ class GpuSceneRasterizer {
+             rw('output')
+         ]);
+ 
++        if (options.scoreScale) {
++            this.scoreRasterizeCompute = mk('scene-score-rasterize', rasterizeBinnedWgsl(options.scoreScale), [
++                ro('projected'),
++                rw('runningState'),
++                ro('tileOffsets'),
++                ro('sortedSplatIndices'),
++                rw('score')
++            ]);
++            this.scoreResolveCompute = mk('scene-score-resolve', scoreResolveWgsl(options.scoreScale), [
++                ro('order'),
++                rw('score'),
++                rw('scoreTotals')
++            ]);
++        }
++
+         const groupPixels = this.groupPixelW * this.groupPixelH;
+         this.visibleCountBuffer = new StorageBuffer(device, 4, BUFFERUSAGE_COPY_SRC | BUFFERUSAGE_COPY_DST);
+         this.tileOffsetsBuffer = new StorageBuffer(device, (numTiles + 1) * 4, 0);
+@@ -431,6 +461,8 @@ class GpuSceneRasterizer {
+         this.rasterizeCompute.setParameter('tileOffsets', this.tileOffsetsBuffer);
+         this.finalizeCompute.setParameter('runningState', this.runningStateBuffer);
+         this.finalizeCompute.setParameter('output', this.outputBuffer);
++        this.scoreRasterizeCompute?.setParameter('runningState', this.runningStateBuffer);
++        this.scoreRasterizeCompute?.setParameter('tileOffsets', this.tileOffsetsBuffer);
+     }
+ 
+     /**
+@@ -454,6 +486,11 @@ class GpuSceneRasterizer {
+             this.colorBuffer = new StorageBuffer(device, Math.max(4, n * cs), BUFFERUSAGE_COPY_DST);
+             this.allocateSort(n);
+             this.allocateWorking(n);
++            if (this.scoreRasterizeCompute) {
++                // WebGPU zero-initializes buffers: counters and totals start at 0.
++                this.scoreBuffer = new StorageBuffer(device, Math.max(4, n * 4), 0);
++                this.scoreTotalsBuffer = new StorageBuffer(device, Math.max(8, n * 8), BUFFERUSAGE_COPY_SRC);
++            }
+         });
+         this.numSplats = n;
+         this.capacity = n;
+@@ -564,6 +601,74 @@ class GpuSceneRasterizer {
+         });
+     }
+ 
++    /**
++     * Add each gaussian's contribution to the given views to the score
++     * totals: per view, the sum over pixels of its blending weight
++     * (transmittance × alpha), i.e. the pixels it effectively paints.
++     * Resident scenes only, built with `scoreScale`. No image is produced.
++     *
++     * @param views - The views to score; each is composited on its own.
++     */
++    async score(views: SceneView[]): Promise<void> {
++        if (!this.positionBuffer || this.streamed) {
++            throw new Error('GpuSceneRasterizer: uploadScene before score');
++        }
++        const rasterize = this.scoreRasterizeCompute;
++        const resolve = this.scoreResolveCompute;
++        if (!rasterize || !resolve) {
++            throw new Error('GpuSceneRasterizer: score needs the scoreScale option');
++        }
++        if (this.numSplats === 0) return;
++        const o = this.options;
++        const imageTilesX = Math.ceil(o.imageWidth / TILE_SIZE);
++        const imageTilesY = Math.ceil(o.imageHeight / TILE_SIZE);
++        const numGroupsX = Math.ceil(imageTilesX / o.groupTilesX);
++        const numGroupsY = Math.ceil(imageTilesY / o.groupTilesY);
++        rasterize.setParameter('score', this.scoreBuffer!);
++        resolve.setParameter('score', this.scoreBuffer!);
++        resolve.setParameter('scoreTotals', this.scoreTotalsBuffer!);
++
++        this.scoring = true;
++        try {
++            for (const view of views) {
++                for (let gy = 0; gy < numGroupsY; gy++) {
++                    for (let gx = 0; gx < numGroupsX; gx++) {
++                        const tilesX = Math.min(o.groupTilesX, imageTilesX - gx * o.groupTilesX);
++                        const tilesY = Math.min(o.groupTilesY, imageTilesY - gy * o.groupTilesY);
++                        this.setUniforms(view, gx, gy, tilesX, tilesY, 0, 1);
++                        const groupPixels = tilesX * tilesY * TILE_SIZE * TILE_SIZE;
++                        this.clearStateCompute.setupDispatch(Math.ceil(groupPixels / (4 * 256)), 1, 1);
++                        this.device.computeDispatch([this.clearStateCompute], 'scene-clear-state');
++                        this.depthSortPass();
++                        await this.rasterRange(this.numSplats, tilesX, tilesY);
++                        // Fold the group's counters into the totals through this view's
++                        // order; per group, so a counter never spans more than one group.
++                        resolve.setParameter('order', this.depthSort.sortedIndices!);
++                        this.dispatch2D(resolve, Math.ceil(this.numSplats / 64), 'scene-score-resolve');
++                        this.submit();
++                    }
++                }
++            }
++        } finally {
++            this.scoring = false;
++        }
++    }
++
++    /**
++     * Read the score totals back.
++     *
++     * @returns Two floats per row: the summed contribution over every scored
++     * view and the largest single view, both in pixels.
++     */
++    async readScores(): Promise<Float32Array> {
++        if (!this.scoreTotalsBuffer) {
++            throw new Error('GpuSceneRasterizer: readScores needs a resident scene built with scoreScale');
++        }
++        const out = new Float32Array(this.numSplats * 2);
++        if (this.numSplats > 0) await this.scoreTotalsBuffer.read(0, this.numSplats * 8, out, true);
++        return out;
++    }
++
+     /**
+      * Render one view, or the mean of several, streaming the gaussians'
+      * records per pass. `ranges(view)` yields the view's visible gaussians
+@@ -870,9 +975,10 @@ class GpuSceneRasterizer {
+         this.findBoundariesCompute.setParameter('sortedTileKeys', sortedKeys);
+         this.dispatch2D(this.findBoundariesCompute, Math.ceil(rangePairs / 64), 'scene-find-boundaries');
+ 
+-        this.rasterizeCompute.setParameter('sortedSplatIndices', sortedValues);
+-        this.rasterizeCompute.setupDispatch(tilesX, tilesY, 1);
+-        device.computeDispatch([this.rasterizeCompute], 'scene-rasterize');
++        const rasterize = this.scoring ? this.scoreRasterizeCompute! : this.rasterizeCompute;
++        rasterize.setParameter('sortedSplatIndices', sortedValues);
++        rasterize.setupDispatch(tilesX, tilesY, 1);
++        device.computeDispatch([rasterize], this.scoring ? 'scene-score-rasterize' : 'scene-rasterize');
+ 
+         // Capture this cut's uniforms before the next cut overwrites them.
+         this.submit();
+@@ -1040,6 +1146,7 @@ class GpuSceneRasterizer {
+         this.emitCompute.setParameter('coverage', this.coverageBuffer);
+         this.emitCompute.setParameter('blockPrefix', this.blockSumsBuffer);
+         this.rasterizeCompute.setParameter('projected', this.projBuffer);
++        this.scoreRasterizeCompute?.setParameter('projected', this.projBuffer);
+     }
+ 
+     private ensurePairCapacity(pairs: number): void {
+@@ -1085,6 +1192,8 @@ class GpuSceneRasterizer {
+             this.finalizeCompute
+         ];
+         if (this.accumulateCompute) computes.push(this.accumulateCompute);
++        if (this.scoreRasterizeCompute) computes.push(this.scoreRasterizeCompute);
++        if (this.scoreResolveCompute) computes.push(this.scoreResolveCompute);
+         for (const c of computes) {
+             c.setParameter('rightX', b.right.x);
+             c.setParameter('rightY', b.right.y);
+@@ -1147,6 +1256,9 @@ class GpuSceneRasterizer {
+     }
+ 
+     private releaseScene(): void {
++        this.scoreBuffer?.destroy();
++        this.scoreTotalsBuffer?.destroy();
++        this.scoreBuffer = this.scoreTotalsBuffer = null;
+         this.positionBuffer?.destroy();
+         this.geometricBuffer?.destroy();
+         this.colorBuffer?.destroy();
+diff --git a/src/lib/gpu/shaders/rasterize-binned.ts b/src/lib/gpu/shaders/rasterize-binned.ts
+index 2eec49b..e5603b9 100644
+--- a/src/lib/gpu/shaders/rasterize-binned.ts
++++ b/src/lib/gpu/shaders/rasterize-binned.ts
+@@ -17,9 +17,16 @@
+  * of the ±π longitude seam evaluates against the splat's nearer copy.
+  * Without the flag the raw delta is used.
+  *
++ * Scoring variant: with `scoreScale` set, every blend also adds its weight
++ * (`T × alpha`, in fixed point) to a per-gaussian counter indexed like
++ * `projected`, so one pass yields each gaussian's contribution to the view
++ * in pixels. The counter is a u32 because WGSL atomics are integers; the
++ * caller picks a scale that cannot overflow for the group's pixel count.
++ *
++ * @param scoreScale - Fixed-point scale of the per-gaussian counter; omit for the plain rasterizer.
+  * @returns WGSL source for the binned-rasterize compute shader.
+  */
+-const rasterizeBinnedWgsl = () => /* wgsl */ `
++const rasterizeBinnedWgsl = (scoreScale?: number) => /* wgsl */ `
+ #include "uniformsStruct"
+ #include "constants"
+ 
+@@ -28,6 +35,7 @@ const rasterizeBinnedWgsl = () => /* wgsl */ `
+ @group(0) @binding(2) var<storage, read_write> runningState: array<vec4<f32>>;
+ @group(0) @binding(3) var<storage, read> tileOffsets: array<u32>;
+ @group(0) @binding(4) var<storage, read> sortedSplatIndices: array<u32>;
++${scoreScale ? '@group(0) @binding(5) var<storage, read_write> score: array<atomic<u32>>;' : ''}
+ 
+ @compute @workgroup_size(TILE_SIZE, TILE_SIZE, 1)
+ fn main(
+@@ -105,6 +113,7 @@ fn main(
+         let alpha = min(OPACITY_CAP, v1.w * max(0.0, prof - GAUSSIAN_FLOOR));
+         if (alpha <= 0.0 || alpha < minAlpha) { continue; }
+         let weight = T * alpha;
++        ${scoreScale ? `atomicAdd(&score[splatIdx], u32(weight * ${scoreScale.toFixed(1)} + 0.5));` : ''}
+         let v2 = projected[splatIdx * 3u + 2u];
+         color = color + weight * v2.rgb;
+         T = T * (1.0 - alpha);
+diff --git a/src/lib/gpu/shaders/score-resolve.ts b/src/lib/gpu/shaders/score-resolve.ts
+new file mode 100644
+index 0000000..6d63198
+--- /dev/null
++++ b/src/lib/gpu/shaders/score-resolve.ts
+@@ -0,0 +1,37 @@
++/**
++ * Folds one pass's per-gaussian contribution counters into the running
++ * totals. The rasterizer counts by depth rank (the index of its projection
++ * records); `order` maps a rank back to the gaussian's row. Per row the
++ * totals hold two floats: the sum of the contributions over all passes and
++ * the largest single pass. The counters are zeroed for the next pass.
++ *
++ * @param scoreScale - Fixed-point scale the rasterizer counted with.
++ * @returns WGSL source for the score-resolve compute shader.
++ */
++const scoreResolveWgsl = (scoreScale: number): string => /* wgsl */ `
++#include "uniformsStruct"
++
++@group(0) @binding(0) var<uniform> uniforms: Uniforms;
++@group(0) @binding(1) var<storage, read> order: array<u32>;
++@group(0) @binding(2) var<storage, read_write> score: array<u32>;
++@group(0) @binding(3) var<storage, read_write> scoreTotals: array<f32>;
++
++@compute @workgroup_size(64)
++fn main(
++    @builtin(workgroup_id) wgId: vec3<u32>,
++    @builtin(local_invocation_id) lid: vec3<u32>,
++    @builtin(num_workgroups) numWg: vec3<u32>
++) {
++    let i = (wgId.y * numWg.x + wgId.x) * 64u + lid.x;
++    if (i >= uniforms.numSplats) { return; }
++    let counted = score[i];
++    if (counted == 0u) { return; }
++    score[i] = 0u;
++    let row = order[i];
++    let value = f32(counted) / ${scoreScale.toFixed(1)};
++    scoreTotals[row * 2u] = scoreTotals[row * 2u] + value;
++    scoreTotals[row * 2u + 1u] = max(scoreTotals[row * 2u + 1u], value);
++}
++`;
++
++export { scoreResolveWgsl };
+diff --git a/src/lib/index.ts b/src/lib/index.ts
+index 3c2bb32..c4355ed 100644
+--- a/src/lib/index.ts
++++ b/src/lib/index.ts
+@@ -104,6 +104,8 @@ export type { WriteImageOptions, WriteVoxelOptions, VoxelMetadata } from './writ
+ // Camera animation tracks for multi-frame image output (editor project,
+ // viewer settings, or a plain frame list)
+ export { loadCameraTrack } from './render/camera-track';
++export { computeViewScores } from './render/view-score';
++export type { ViewScoreCamera, ViewScoreOptions, ViewScores } from './render/view-score';
+ export type { CameraTrack, TrackPose } from './render/camera-track';
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/src/lib/render/index.ts b/src/lib/render/index.ts
+index 82b36fa..314e261 100644
+--- a/src/lib/render/index.ts
++++ b/src/lib/render/index.ts
+@@ -7,3 +7,4 @@ export {
+     type SceneTier
+ } from './scene-renderer';
+ export { loadCameraTrack, type CameraTrack, type TrackPose } from './camera-track';
++export { computeViewScores, type ViewScoreCamera, type ViewScoreOptions, type ViewScores } from './view-score';
+diff --git a/src/lib/render/scene-renderer.ts b/src/lib/render/scene-renderer.ts
+index d39d02b..6344b05 100644
+--- a/src/lib/render/scene-renderer.ts
++++ b/src/lib/render/scene-renderer.ts
+@@ -63,6 +63,8 @@ type SceneRendererOptions = {
+     compensation?: boolean;
+     /** Screen-space filter, in pixels², of scenes trained with anti-aliasing; default `AA_FILTER_COV` (0.1). */
+     antiAliasFilterSize?: number;
++    /** Allow {@link SceneRenderer.accumulateScores}; resident tier only. Default false. */
++    score?: boolean;
+ };
+ 
+ /**
+@@ -147,6 +149,10 @@ class SceneRenderer {
+             );
+         }
+         const bg = options.background;
++        // Largest counter scale that cannot overflow a u32 when one gaussian
++        // covers a whole group at full weight; 2¹⁶ resolves weights to 1/131072.
++        const groupPixels = groupTilesX * groupTilesY * TILE_SIZE * TILE_SIZE;
++        const scoreScale = Math.max(1, Math.min(65536, Math.floor((2 ** 32 - 1) / (groupPixels + 1))));
+         this.raster = new GpuSceneRasterizer(device, {
+             numSHBands: this.numSHBands,
+             projection: options.projection,
+@@ -161,7 +167,8 @@ class SceneRenderer {
+             bgR: bg.r,
+             bgG: bg.g,
+             bgB: bg.b,
+-            bgA: bg.a
++            bgA: bg.a,
++            scoreScale: options.score ? scoreScale : undefined
+         });
+     }
+ 
+@@ -235,7 +242,41 @@ class SceneRenderer {
+             throw new Error('SceneRenderer: upload before render');
+         }
+         const { projection, width, height } = this.options;
+-        const views = cameras.map((camera) => {
++        const views = this.views(cameras);
++        if (this.tier === 'resident') {
++            return this.raster.render(views);
++        }
++        return this.raster.renderStreamed(views, (view) => this.ranges(view));
++    }
++
++    /**
++     * Add each gaussian's contribution to the given views to the scene's
++     * score totals, without producing images: per view, the sum over pixels
++     * of the gaussian's blending weight (transmittance × alpha). Needs the
++     * `score` option and the resident tier.
++     *
++     * @param cameras - The views to score; same constraints as {@link render}.
++     */
++    async accumulateScores(cameras: RenderCamera[]): Promise<void> {
++        if (this.tier !== 'resident') {
++            throw new Error('SceneRenderer: scoring needs the resident tier');
++        }
++        await this.raster.score(this.views(cameras));
++    }
++
++    /**
++     * Read back the totals {@link accumulateScores} built up.
++     *
++     * @returns Two floats per gaussian, by row: the summed contribution over
++     * every scored view and the largest single view, both in pixels.
++     */
++    readScores(): Promise<Float32Array> {
++        return this.raster.readScores();
++    }
++
++    private views(cameras: RenderCamera[]): SceneView[] {
++        const { projection, width, height } = this.options;
++        return cameras.map((camera) => {
+             if ((camera.projection ?? 'pinhole') !== projection || camera.width !== width || camera.height !== height) {
+                 throw new Error("SceneRenderer: camera projection or size differs from the renderer's");
+             }
+@@ -246,10 +287,6 @@ class SceneRenderer {
+                 apertureScale: camera.apertureScale ?? 0
+             };
+         });
+-        if (this.tier === 'resident') {
+-            return this.raster.render(views);
+-        }
+-        return this.raster.renderStreamed(views, (view) => this.ranges(view));
+     }
+ 
+     /**
+diff --git a/src/lib/render/view-score.ts b/src/lib/render/view-score.ts
+new file mode 100644
+index 0000000..31e568a
+--- /dev/null
++++ b/src/lib/render/view-score.ts
+@@ -0,0 +1,140 @@
++import { Vec3 } from 'playcanvas';
++import type { GraphicsDevice } from 'playcanvas';
++
++import type { ChunkDataPool, ChunkSource } from '../chunk';
++import { computeWriteTransform } from '../data-table';
++import { Transform } from '../utils';
++
++import type { RenderCamera } from './camera';
++import { SceneRenderer } from './scene-renderer';
++
++type Vec3Like = { x: number; y: number; z: number };
++
++/** One viewpoint to score from, in the PlayCanvas default space (Y up). */
++type ViewScoreCamera = {
++    /** Eye position. */
++    position: Vec3Like;
++    /** Point the camera looks at. */
++    target: Vec3Like;
++    /** Up vector; default +Y. */
++    up?: Vec3Like;
++    /** Vertical field of view in degrees; default {@link ViewScoreOptions.fov}. */
++    fov?: number;
++};
++
++type ViewScoreOptions = {
++    /** Width of the scoring image in pixels; default 640. */
++    width?: number;
++    /** Height of the scoring image in pixels; default 360. */
++    height?: number;
++    /** Vertical field of view in degrees for cameras without their own; default 60. */
++    fov?: number;
++    /** Near clip distance in world units; default 0.2. */
++    near?: number;
++    /** Called after each view with the number of views done. */
++    onProgress?: (done: number, total: number) => void;
++};
++
++/** Per-gaussian view scores, indexed by the source's LOD 0 row. */
++type ViewScores = {
++    /** Contribution summed over all views, in pixels of the scoring image. */
++    sum: Float32Array;
++    /** Contribution to the single view the gaussian matters most in, in pixels. */
++    max: Float32Array;
++    /** Views scored. */
++    views: number;
++    /** Pixels per scoring image, for normalizing. */
++    pixels: number;
++};
++
++/**
++ * Score every gaussian of a scene by how much it contributes to a set of
++ * views. A gaussian's contribution to one view is the sum over pixels of its
++ * blending weight (transmittance × alpha): the number of pixels it
++ * effectively paints. Gaussians that are behind the camera, outside the
++ * frustum, hidden behind opaque geometry or too faint to register score 0.
++ *
++ * The scene is held resident on the GPU, so it must fit the device (see
++ * `residentSceneFits`). Only LOD 0 is scored; view a multi-LOD source through
++ * `selectLod` first. The source's pending transform is honoured.
++ *
++ * @param device - WebGPU graphics device.
++ * @param source - The scene.
++ * @param pool - Pool for the chunk read buffers.
++ * @param cameras - The viewpoints.
++ * @param options - Scoring image size, field of view and near plane.
++ * @returns The scores by row.
++ * @example
++ * const scores = await computeViewScores(device, source, pool, [
++ *     { position: { x: 0, y: 1, z: 4 }, target: { x: 0, y: 1, z: 0 } }
++ * ]);
++ * const hidden = scores.sum.filter(s => s === 0).length;
++ */
++const computeViewScores = async (
++    device: GraphicsDevice,
++    source: ChunkSource,
++    pool: ChunkDataPool,
++    cameras: ViewScoreCamera[],
++    options: ViewScoreOptions = {}
++): Promise<ViewScores> => {
++    const width = options.width ?? 640;
++    const height = options.height ?? 360;
++    const defaultFov = options.fov ?? 60;
++    let near = options.near ?? 0.2;
++
++    // Cameras live in the PlayCanvas default space, the scene in its source
++    // space: move the cameras into the scene's rather than baking the scene.
++    const delta = computeWriteTransform(source.meta.transform, Transform.IDENTITY);
++    const toData = delta ? delta.clone().invert() : null;
++    const point = (p: Vec3Like): Vec3 => {
++        const v = new Vec3(p.x, p.y, p.z);
++        if (toData) toData.transformPoint(v, v);
++        return v;
++    };
++    const dir = (d: Vec3Like): Vec3 => {
++        const v = new Vec3(d.x, d.y, d.z);
++        if (toData) toData.rotation.transformVector(v, v);
++        return v;
++    };
++    if (toData) near *= toData.scale;
++
++    const scene = new SceneRenderer(device, source, pool, {
++        projection: 'pinhole',
++        width,
++        height,
++        background: { r: 0, g: 0, b: 0, a: 0 },
++        tier: 'resident',
++        score: true
++    });
++    try {
++        await scene.upload();
++        for (let i = 0; i < cameras.length; i++) {
++            const c = cameras[i];
++            const camera: RenderCamera = {
++                projection: 'pinhole',
++                position: point(c.position),
++                target: point(c.target),
++                up: dir(c.up ?? { x: 0, y: 1, z: 0 }),
++                fovY: ((c.fov ?? defaultFov) * Math.PI) / 180,
++                width,
++                height,
++                near
++            };
++            await scene.accumulateScores([camera]);
++            options.onProgress?.(i + 1, cameras.length);
++        }
++        const totals = await scene.readScores();
++        const n = scene.numSplats;
++        const sum = new Float32Array(n);
++        const max = new Float32Array(n);
++        for (let i = 0; i < n; i++) {
++            sum[i] = totals[i * 2];
++            max[i] = totals[i * 2 + 1];
++        }
++        return { sum, max, views: cameras.length, pixels: width * height };
++    } finally {
++        scene.destroy();
++    }
++};
++
++export { computeViewScores, type ViewScoreCamera, type ViewScoreOptions, type ViewScores };
+diff --git a/test/view-score.test.mjs b/test/view-score.test.mjs
+new file mode 100644
+index 0000000..95b25ee
+--- /dev/null
++++ b/test/view-score.test.mjs
+@@ -0,0 +1,147 @@
++/**
++ * View scores.
++ *
++ * `computeViewScores` gives each gaussian the pixels it effectively paints
++ * over a set of views (the sum of its blending weights). The scenes here
++ * have known visibility: an opaque wall facing the camera, gaussians in
++ * front of it, behind it, behind the camera and outside the frustum.
++ */
++
++import assert from 'node:assert';
++import { after, before, describe, it } from 'node:test';
++
++let device = null;
++
++before(async () => {
++    try {
++        const { createDevice } = await import('../src/cli/node-device.js');
++        device = await createDevice();
++    } catch {
++        device = null;
++    }
++});
++
++after(() => {
++    device?.destroy?.();
++});
++
++const logit = p => Math.log(p / (1 - p));
++
++/**
++ * Camera at z = 6 looking down -z. A wall of opaque gaussians fills the
++ * plane z = 0; groups of small gaussians sit in front of it (z = 2), behind
++ * it (z = -2), behind the camera (z = 9) and far off to the side (x = 60).
++ *
++ * @returns {Promise<object>} The scene and the row ranges of its groups.
++ */
++const makeScene = async () => {
++    const { Column, DataTable, dataTableToChunkSource } = await import('../src/lib/index.js');
++    const { createChunkDataPool } = await import('../src/lib/chunk/index.js');
++    const rows = [];
++    const add = (x, y, z, logScale, alpha) => rows.push({ x, y, z, logScale, alpha });
++
++    const groups = {};
++    const group = (name, build) => {
++        const start = rows.length;
++        build();
++        groups[name] = [start, rows.length];
++    };
++    // Wall: a 41 × 41 grid at 0.25 spacing, sigma 0.25, so it is opaque everywhere the camera looks.
++    group('wall', () => {
++        for (let j = -20; j <= 20; j++) for (let i = -20; i <= 20; i++) add(i * 0.25, j * 0.25, 0, Math.log(0.25), 0.999);
++    });
++    const cluster = (z, cx = 0) => () => {
++        for (let j = -2; j <= 2; j++) for (let i = -2; i <= 2; i++) add(cx + i * 0.3, j * 0.3, z, Math.log(0.05), 0.9);
++    };
++    group('front', cluster(2));
++    group('hidden', cluster(-2));
++    group('behindCamera', cluster(9));
++    group('outside', cluster(2, 60));
++
++    const n = rows.length;
++    const col = fn => Float32Array.from(rows, fn);
++    const one = new Float32Array(n).fill(1);
++    const zero = new Float32Array(n);
++    const dataTable = new DataTable([
++        new Column('x', col(r => r.x)), new Column('y', col(r => r.y)), new Column('z', col(r => r.z)),
++        new Column('rot_0', one), new Column('rot_1', zero), new Column('rot_2', zero), new Column('rot_3', zero),
++        new Column('scale_0', col(r => r.logScale)), new Column('scale_1', col(r => r.logScale)), new Column('scale_2', col(r => r.logScale)),
++        new Column('opacity', col(r => logit(r.alpha))),
++        new Column('f_dc_0', one), new Column('f_dc_1', one), new Column('f_dc_2', one)
++    ]);
++    const chunkSize = 1024;
++    return {
++        source: dataTableToChunkSource(dataTable, chunkSize),
++        pool: createChunkDataPool({ chunkSize }),
++        groups,
++        n
++    };
++};
++
++const camera = { position: { x: 0, y: 0, z: 6 }, target: { x: 0, y: 0, z: 0 } };
++const size = { width: 320, height: 192 };
++
++const range = (array, [start, end]) => Array.from(array.subarray(start, end));
++
++describe('computeViewScores', () => {
++    it('scores visible gaussians and zeroes hidden ones', async (t) => {
++        if (!device) return t.skip('no WebGPU device');
++        const { computeViewScores } = await import('../src/lib/index.js');
++        const scene = await makeScene();
++        const scores = await computeViewScores(device, scene.source, scene.pool, [camera], size);
++
++        assert.strictEqual(scores.sum.length, scene.n);
++        assert.strictEqual(scores.views, 1);
++        assert.ok(range(scores.sum, scene.groups.front).every(s => s > 1), 'gaussians in front of the wall paint pixels');
++        assert.ok(range(scores.sum, scene.groups.hidden).every(s => s === 0), 'gaussians behind the wall score 0');
++        assert.ok(range(scores.sum, scene.groups.behindCamera).every(s => s === 0), 'gaussians behind the camera score 0');
++        assert.ok(range(scores.sum, scene.groups.outside).every(s => s === 0), 'gaussians outside the frustum score 0');
++        assert.ok(range(scores.sum, scene.groups.wall).some(s => s > 1), 'the wall is seen');
++        // One view: the largest single view is the sum.
++        assert.deepStrictEqual(Array.from(scores.max), Array.from(scores.sum));
++    });
++
++    it('sums to the coverage of the rendered image', async (t) => {
++        if (!device) return t.skip('no WebGPU device');
++        const { computeViewScores } = await import('../src/lib/index.js');
++        const { SceneRenderer } = await import('../src/lib/render/index.js');
++        const { Vec3 } = await import('playcanvas');
++        const scene = await makeScene();
++        const scores = await computeViewScores(device, scene.source, scene.pool, [camera], size);
++
++        // Every blend moves weight from the transmittance to a gaussian, so the
++        // scores sum to the image's total alpha (1 - T per pixel).
++        const renderer = new SceneRenderer(device, scene.source, scene.pool, {
++            projection: 'pinhole', ...size, background: { r: 0, g: 0, b: 0, a: 0 }, tier: 'resident'
++        });
++        await renderer.upload();
++        const image = await renderer.render({
++            position: new Vec3(0, 0, 6), target: new Vec3(0, 0, 0), up: new Vec3(0, 1, 0),
++            fovY: 60 * Math.PI / 180, ...size, near: 0.2
++        });
++        renderer.destroy();
++        let coverage = 0;
++        for (let i = 3; i < image.length; i += 4) coverage += image[i] / 255;
++        const total = scores.sum.reduce((a, b) => a + b, 0);
++        assert.ok(coverage > 1000, `the scene covers pixels (${coverage})`);
++        assert.ok(Math.abs(total - coverage) / coverage < 0.01, `scores ${total} vs coverage ${coverage}`);
++    });
++
++    it('accumulates over views and tracks the best view', async (t) => {
++        if (!device) return t.skip('no WebGPU device');
++        const { computeViewScores } = await import('../src/lib/index.js');
++        const scene = await makeScene();
++        // The second camera stands behind the wall: what was hidden is now in front.
++        const back = { position: { x: 0, y: 0, z: -6 }, target: { x: 0, y: 0, z: 0 } };
++        const one = await computeViewScores(device, scene.source, scene.pool, [camera], size);
++        const two = await computeViewScores(device, scene.source, scene.pool, [camera, back], size);
++
++        assert.ok(range(two.sum, scene.groups.hidden).every(s => s > 1), 'the back view sees the hidden group');
++        const [start, end] = scene.groups.front;
++        for (let i = start; i < end; i++) {
++            assert.ok(Math.abs(two.sum[i] - one.sum[i]) < 1e-3, 'the front group gains nothing from the back view');
++            assert.ok(Math.abs(two.max[i] - one.max[i]) < 1e-3);
++        }
++        for (let i = 0; i < scene.n; i++) assert.ok(two.max[i] <= two.sum[i] + 1e-3);
++    });
++});
+-- 
+2.43.0
+

@@ -1,0 +1,1318 @@
+From 784a37136b4717a060261213533c7908a83d9f08 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 21:27:37 +0000
+Subject: [PATCH 3/3] feat: Add filterViewScore action and --filter-view-score
+
+Remove gaussians that contribute too little to a set of views. Scoring now
+works in every renderer tier (streamed scenes total on the CPU) and counts
+in 64 bits, so scores no longer depend on the image size.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01RfkFS6mjG8zdavwCoa7Kk9
+---
+ AGENTS.md                               |   2 +-
+ README.md                               |  30 +++-
+ src/cli/index.ts                        |  63 ++++++++
+ src/lib/gpu/gpu-scene-rasterizer.ts     | 199 +++++++++++++++++++-----
+ src/lib/gpu/shaders/rasterize-binned.ts |  32 ++--
+ src/lib/gpu/shaders/score-resolve.ts    |  29 ++--
+ src/lib/index.ts                        |   3 +-
+ src/lib/process-source.ts               |  30 +++-
+ src/lib/process.ts                      |  50 +++++-
+ src/lib/render/index.ts                 |   8 +-
+ src/lib/render/scene-renderer.ts        |  36 +++--
+ src/lib/render/view-score.ts            |  76 ++++++++-
+ test/cli.test.mjs                       |  71 +++++++++
+ test/view-score.test.mjs                | 165 +++++++++++++++++++-
+ 14 files changed, 710 insertions(+), 84 deletions(-)
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 254020e..7b06afa 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -332,7 +332,7 @@ const result = await processSourceBridged(source, [
+ ], pool);
+ ```
+ 
+-Action `kind` values (camelCase): `translate`, `rotate`, `scale`, `filterNaN`, `filterByValue`, `filterBands`, `filterBox`, `filterSphere`, `filterFloaters`, `filterCluster`, `param`, `stats`, `info`, `mortonOrder`, `decimate`.
++Action `kind` values (camelCase): `translate`, `rotate`, `scale`, `filterNaN`, `filterByValue`, `filterBands`, `filterBox`, `filterSphere`, `filterFloaters`, `filterCluster`, `filterViewScore`, `param`, `stats`, `info`, `mortonOrder`, `decimate`.
+ 
+ ## Things to Avoid
+ 
+diff --git a/README.md b/README.md
+index 1c2017a..e8555e7 100644
+--- a/README.md
++++ b/README.md
+@@ -162,6 +162,13 @@ Actions execute in the order specified and can be repeated. Any action may appea
+                                           GPU-voxelizes at coarse resolution (res world units/voxel).
+                                           Default: res=1.0, opacity=0.999, min=0.1.
+                                           Bare flag (no value) uses all defaults.
++    --filter-view-score [px,views]      Remove Gaussians that paint <= px pixels in their best view.
++                                          Views come from --camera-track (up to 'views' frames,
++                                          evenly spaced; --frames narrows the range) or from
++                                          --camera-pos/--camera-target, scored at --resolution
++                                          (default 640x360) with --camera-fov and --camera-near.
++                                          Default: px=0, views=64. With px=0 only Gaussians no
++                                          view sees are removed and the scored views are unchanged.
+ -p, --params           <key=val,...>    Pass parameters to .mjs generator script
+ -l, --tag-lod          <n>              Tag the Gaussians with LOD level n (n >= 0, or -1 for environment)
+     --stats            [text|json]      Print file info, per-column statistics and the fill/overdraw ratio to stdout. Default: text
+@@ -189,7 +196,7 @@ These options configure a run as a whole rather than operating on splat data —
+ 
+ ### GPU Options
+ 
+-Used by SOG compression and GPU voxelization (`--filter-cluster`, `--filter-floaters`, `.voxel.json` output).
++Used by SOG compression, GPU voxelization (`--filter-cluster`, `--filter-floaters`, `.voxel.json` output), image rendering and `--filter-view-score`.
+ 
+ ```none
+     --list-gpus                         List available GPU adapters and exit
+@@ -425,6 +432,27 @@ splat-transform input.ply --decimate 50000 output.ply
+ splat-transform input.ply -d 25% output.ply
+ ```
+ 
++### Optimizing for a Viewing Area
++
++`--filter-view-score` renders the scene from a set of cameras and scores every Gaussian by the pixels it effectively paints (the sum of its blending weights over the image). Gaussians that are hidden, out of view or too faint to register in every view score 0.
++
++```bash
++# Drop everything a camera path never sees (the path's views are unchanged).
++# The track is a supersplat project's document.json, a viewer settings.json or a frame list.
++splat-transform --camera-track document.json input.ply --filter-view-score output.sog
++
++# Also drop Gaussians that paint at most a quarter pixel in their best view,
++# scoring at the resolution the scene will be shown at
++splat-transform --camera-track views.json --resolution 1280x720 input.ply --filter-view-score 0.25 output.sog
++
++# A single static viewpoint
++splat-transform --camera-pos 0,1.6,4 --camera-target 0,1.6,0 input.ply --filter-view-score output.spz
++```
++
++Scores are in pixels of the scoring image, so a threshold above 0 depends on `--resolution` and on how close the cameras are: score at the size and distance the scene will be viewed at. The result is tailored to the scored views. From anywhere else the scene shows holes, so restrict the viewer's camera accordingly. A threshold above 0 removes detail rather than merging it; raise it in small steps and compare renders.
++
++A frame list is a JSON file: `{ "frames": [{ "position": [x, y, z], "target": [x, y, z], "fov": 60 }, ...] }`.
++
+ ### Advanced Usage
+ 
+ ```bash
+diff --git a/src/cli/index.ts b/src/cli/index.ts
+index d4668a8..a1ec167 100644
+--- a/src/cli/index.ts
++++ b/src/cli/index.ts
+@@ -45,6 +45,8 @@ import type {
+     ProcessAction,
+     FilterFloaters,
+     FilterCluster,
++    FilterViewScore,
++    ViewScoreCamera,
+     Options as LibOptions,
+     CollisionMeshShape,
+     ReadFileSystem,
+@@ -231,6 +233,7 @@ const cliOptionsConfig = {
+     'decimate-adaptive': { type: 'string', multiple: true },
+     'filter-cluster': { type: 'string', short: 'C', multiple: true },
+     'filter-floaters': { type: 'string', short: 'F', multiple: true },
++    'filter-view-score': { type: 'string', multiple: true },
+     params: { type: 'string', short: 'p', multiple: true },
+     'tag-lod': { type: 'string', short: 'l', multiple: true },
+     stats: { type: 'string', multiple: true },
+@@ -257,6 +260,7 @@ const optionalValueOptions = new Map<string, OptionalValueValidator>([
+     ['-C', isNumericValue],
+     ['--filter-floaters', isNumericValue],
+     ['-F', isNumericValue],
++    ['--filter-view-score', isNumericValue],
+     ['--voxel-external-fill', isNumericValue],
+     ['--voxel-floor-fill', isNumericValue],
+     ['--voxel-carve', isNumericValue],
+@@ -919,6 +923,62 @@ const parseArguments = async () => {
+                     current.processActions.push(ffAction);
+                     break;
+                 }
++                case 'filter-view-score': {
++                    const parts = t.value ? t.value.split(',').map((p: string) => p.trim()) : [];
++                    const minPixels = parts[0] ? parseNumber(parts[0]) : 0;
++                    if (!(minPixels >= 0)) {
++                        throw new Error(`Invalid filter-view-score threshold: ${parts[0]}. Must be >= 0.`);
++                    }
++                    const maxViews = parts[1] ? parseInteger(parts[1]) : 64;
++                    if (maxViews < 1) {
++                        throw new Error(`Invalid filter-view-score view count: ${parts[1]}. Must be >= 1.`);
++                    }
++                    // The views come from the camera options shared with image
++                    // output: a track sampled evenly, or the single static camera.
++                    const cameras: ViewScoreCamera[] = [];
++                    if (renderCameraTrack) {
++                        const first = renderFrames?.[0] ?? 0;
++                        const last = renderFrames?.[1] ?? renderCameraTrack.frameCount - 1;
++                        if (last >= renderCameraTrack.frameCount) {
++                            throw new Error(
++                                `--frames ${first}-${last} exceeds the camera track's ${renderCameraTrack.frameCount} frames.`
++                            );
++                        }
++                        const count = Math.min(maxViews, last - first + 1);
++                        for (let k = 0; k < count; k++) {
++                            const frame = count === 1 ? first : first + ((last - first) * k) / (count - 1);
++                            const pose = renderCameraTrack.poseAt(frame);
++                            cameras.push({
++                                position: pose.position,
++                                target: pose.target,
++                                up: pose.up ?? renderUp,
++                                fov: pose.fov
++                            });
++                        }
++                    } else if (renderCameraPosition) {
++                        cameras.push({
++                            position: renderCameraPosition,
++                            target: renderLookAt ?? { x: 0, y: 0, z: 0 },
++                            up: renderUp,
++                            fov: renderFov
++                        });
++                    } else {
++                        throw new Error(
++                            '--filter-view-score needs the views to score from: --camera-track, or --camera-pos (with --camera-target).'
++                        );
++                    }
++                    const fvAction: FilterViewScore = {
++                        kind: 'filterViewScore',
++                        cameras,
++                        minPixels,
++                        width: renderWidth,
++                        height: renderHeight,
++                        fov: renderFov,
++                        near: renderNear
++                    };
++                    current.processActions.push(fvAction);
++                    break;
++                }
+             }
+         }
+     }
+@@ -966,6 +1026,9 @@ ACTIONS (executed in order; can be repeated)
+                                               target exceeds memory. Nothing is written without it
+     -F, --filter-floaters  [size,op,min]    Remove Gaussians not contributing to any solid voxel. Default: 0.05,0.1,0.004
+     -C, --filter-cluster   [res,op,min]     Keep only the connected cluster at --seed-pos. Default: 1.0,0.999,0.1
++        --filter-view-score [px,views]      Remove Gaussians painting <= px pixels in their best view. Views come from
++                                              --camera-track (up to 'views' frames, evenly spaced) or --camera-pos/
++                                              --camera-target, scored at --resolution (640x360). Default: 0,64
+     -p, --params           <key=val,...>    Pass parameters to .mjs generator script
+     -l, --tag-lod          <n>              Tag the Gaussians with LOD level n (n >= 0, or -1 for environment)
+         --stats            [text|json]      Print file info, per-column statistics and the fill/overdraw ratio to stdout. Default: text
+diff --git a/src/lib/gpu/gpu-scene-rasterizer.ts b/src/lib/gpu/gpu-scene-rasterizer.ts
+index 1046c77..2a7a5a9 100644
+--- a/src/lib/gpu/gpu-scene-rasterizer.ts
++++ b/src/lib/gpu/gpu-scene-rasterizer.ts
+@@ -51,7 +51,7 @@ import { initTileOffsetsWgsl } from './shaders/init-tile-offsets';
+ import { projectWgsl } from './shaders/project';
+ import { rasterizeBinnedWgsl } from './shaders/rasterize-binned';
+ import { SCAN_BLOCK, scanBlocksWgsl, scanSumsWgsl } from './shaders/scan-blocks';
+-import { scoreResolveWgsl } from './shaders/score-resolve';
++import { SCORE_SCALE, scoreResolveWgsl } from './shaders/score-resolve';
+ import { tileBinEmitPairsWgsl } from './shaders/tile-bin-emit-pairs';
+ import { uniformsStruct, uniformFormatEntries } from './shaders/uniforms';
+ 
+@@ -118,12 +118,8 @@ type SceneRasterizerOptions = {
+     bgG: number;
+     bgB: number;
+     bgA: number;
+-    /**
+-     * Enables {@link GpuSceneRasterizer.score}: the fixed-point scale of the
+-     * per-gaussian contribution counters. A counter is a u32 summed over one
+-     * group's pixels, so `scoreScale × group pixels` must stay below 2³².
+-     */
+-    scoreScale?: number;
++    /** Enables {@link GpuSceneRasterizer.score} and {@link GpuSceneRasterizer.scoreStreamed}. */
++    score?: boolean;
+ };
+ 
+ /**
+@@ -147,6 +143,12 @@ type StreamedRange = {
+     position: ChunkData;
+     geometric: ChunkData;
+     color: ChunkData;
++    /**
++     * Scoring only: the rows the range's gaussians come from are
++     * `rows[rowOffset .. rowOffset + count)`, in the range's order.
++     */
++    rows?: Uint32Array;
++    rowOffset?: number;
+ };
+ 
+ /** The scene's order for one view: `order[0..visible)` are the visible gaussians, front to back. */
+@@ -242,9 +244,17 @@ class GpuSceneRasterizer {
+     /** Scoring only: the rasterizer that counts contributions, and the pass folding them into the totals. */
+     private scoreRasterizeCompute: Compute | null = null;
+     private scoreResolveCompute: Compute | null = null;
+-    /** Scoring only: per-rank counters of one pass, and per-row (sum, max) totals. */
++    /** Scoring only: per-rank counters of one pass (two words each), and per-row (sum, max) totals when resident. */
+     private scoreBuffer: StorageBuffer | null = null;
+     private scoreTotalsBuffer: StorageBuffer | null = null;
++    /**
++     * Scoring a streamed scene: the totals live on the CPU, as the scene may
++     * exceed any GPU binding. `view` collects one view's contributions before
++     * they fold into `sum` and `max`.
++     */
++    private cpuScores: { sum: Float32Array; max: Float32Array; view: Float32Array } | null = null;
++    private scoreReadback = new Uint32Array(0);
++    private scoreZeros = new Uint32Array(0);
+     /** True while `score` runs: cuts rasterize through the counting shader. */
+     private scoring = false;
+ 
+@@ -426,15 +436,15 @@ class GpuSceneRasterizer {
+             rw('output')
+         ]);
+ 
+-        if (options.scoreScale) {
+-            this.scoreRasterizeCompute = mk('scene-score-rasterize', rasterizeBinnedWgsl(options.scoreScale), [
++        if (options.score) {
++            this.scoreRasterizeCompute = mk('scene-score-rasterize', rasterizeBinnedWgsl(true), [
+                 ro('projected'),
+                 rw('runningState'),
+                 ro('tileOffsets'),
+                 ro('sortedSplatIndices'),
+                 rw('score')
+             ]);
+-            this.scoreResolveCompute = mk('scene-score-resolve', scoreResolveWgsl(options.scoreScale), [
++            this.scoreResolveCompute = mk('scene-score-resolve', scoreResolveWgsl(), [
+                 ro('order'),
+                 rw('score'),
+                 rw('scoreTotals')
+@@ -488,7 +498,7 @@ class GpuSceneRasterizer {
+             this.allocateWorking(n);
+             if (this.scoreRasterizeCompute) {
+                 // WebGPU zero-initializes buffers: counters and totals start at 0.
+-                this.scoreBuffer = new StorageBuffer(device, Math.max(4, n * 4), 0);
++                this.scoreBuffer = new StorageBuffer(device, Math.max(8, n * 8), 0);
+                 this.scoreTotalsBuffer = new StorageBuffer(device, Math.max(8, n * 8), BUFFERUSAGE_COPY_SRC);
+             }
+         });
+@@ -548,6 +558,7 @@ class GpuSceneRasterizer {
+         this.capacity = rangeRows;
+         this.streamed = true;
+         this.orderReadback = new Uint32Array(n);
++        this.allocateCpuScores(n, rangeRows);
+ 
+         await this.readChunks(source, pool, ['position'], (rowStart, count, data) => {
+             this.scenePositionBuffer!.write(
+@@ -578,6 +589,7 @@ class GpuSceneRasterizer {
+         this.numSplats = numSplats;
+         this.capacity = rangeRows;
+         this.streamed = true;
++        this.allocateCpuScores(numSplats, rangeRows);
+         this.bindWorking();
+     }
+ 
+@@ -605,7 +617,7 @@ class GpuSceneRasterizer {
+      * Add each gaussian's contribution to the given views to the score
+      * totals: per view, the sum over pixels of its blending weight
+      * (transmittance × alpha), i.e. the pixels it effectively paints.
+-     * Resident scenes only, built with `scoreScale`. No image is produced.
++     * Resident scenes, built with the `score` option. No image is produced.
+      *
+      * @param views - The views to score; each is composited on its own.
+      */
+@@ -616,14 +628,10 @@ class GpuSceneRasterizer {
+         const rasterize = this.scoreRasterizeCompute;
+         const resolve = this.scoreResolveCompute;
+         if (!rasterize || !resolve) {
+-            throw new Error('GpuSceneRasterizer: score needs the scoreScale option');
++            throw new Error('GpuSceneRasterizer: score needs the score option');
+         }
+         if (this.numSplats === 0) return;
+         const o = this.options;
+-        const imageTilesX = Math.ceil(o.imageWidth / TILE_SIZE);
+-        const imageTilesY = Math.ceil(o.imageHeight / TILE_SIZE);
+-        const numGroupsX = Math.ceil(imageTilesX / o.groupTilesX);
+-        const numGroupsY = Math.ceil(imageTilesY / o.groupTilesY);
+         rasterize.setParameter('score', this.scoreBuffer!);
+         resolve.setParameter('score', this.scoreBuffer!);
+         resolve.setParameter('scoreTotals', this.scoreTotalsBuffer!);
+@@ -636,20 +644,81 @@ class GpuSceneRasterizer {
+                 // own sorter, so the order survives the groups' passes).
+                 this.setUniforms(view, 0, 0, o.groupTilesX, o.groupTilesY, 0, 1);
+                 this.depthSortPass();
+-                for (let gy = 0; gy < numGroupsY; gy++) {
+-                    for (let gx = 0; gx < numGroupsX; gx++) {
+-                        const tilesX = Math.min(o.groupTilesX, imageTilesX - gx * o.groupTilesX);
+-                        const tilesY = Math.min(o.groupTilesY, imageTilesY - gy * o.groupTilesY);
+-                        this.setUniforms(view, gx, gy, tilesX, tilesY, 0, 1);
+-                        const groupPixels = tilesX * tilesY * TILE_SIZE * TILE_SIZE;
+-                        this.clearStateCompute.setupDispatch(Math.ceil(groupPixels / (4 * 256)), 1, 1);
+-                        this.device.computeDispatch([this.clearStateCompute], 'scene-clear-state');
+-                        await this.rasterRange(this.numSplats, tilesX, tilesY);
+-                        // Fold the group's counters into the totals through this view's
+-                        // order; per group, so a counter never spans more than one group.
+-                        resolve.setParameter('order', this.depthSort.sortedIndices!);
+-                        this.dispatch2D(resolve, Math.ceil(this.numSplats / 64), 'scene-score-resolve');
+-                        this.submit();
++                for (const { gx, gy, tilesX, tilesY } of this.groups()) {
++                    this.beginScoreGroup(view, gx, gy, tilesX, tilesY);
++                    await this.rasterRange(this.numSplats, tilesX, tilesY);
++                    // Fold the group's counters into the totals through this view's order.
++                    resolve.setParameter('order', this.depthSort.sortedIndices!);
++                    this.dispatch2D(resolve, Math.ceil(this.numSplats / 64), 'scene-score-resolve');
++                    this.submit();
++                }
++            }
++        } finally {
++            this.scoring = false;
++        }
++    }
++
++    /**
++     * {@link score} for a streamed scene. `ranges(view)` yields the view's
++     * visible gaussians front to back as for {@link renderStreamed}, each
++     * range naming the rows it holds (`rows`, `rowOffset`). The counters of a
++     * range are read back and totalled on the CPU, as a streamed scene's
++     * totals need not fit a GPU binding.
++     *
++     * @param views - The views to score; each is composited on its own.
++     * @param ranges - Produces a view's depth-sorted ranges.
++     */
++    async scoreStreamed(views: SceneView[], ranges: (view: SceneView) => AsyncIterable<StreamedRange>): Promise<void> {
++        if (!this.positionBuffer || !this.streamed) {
++            throw new Error('GpuSceneRasterizer: uploadPositions or prepareStreamed before scoreStreamed');
++        }
++        const rasterize = this.scoreRasterizeCompute;
++        const totals = this.cpuScores;
++        if (!rasterize || !totals) {
++            throw new Error('GpuSceneRasterizer: scoreStreamed needs the score option');
++        }
++        if (this.numSplats === 0) return;
++        const { sum, max, view: seen } = totals;
++        const scoreBuffer = this.scoreBuffer!;
++        rasterize.setParameter('score', scoreBuffer);
++
++        this.scoring = true;
++        try {
++            for (const view of views) {
++                for (const { gx, gy, tilesX, tilesY } of this.groups()) {
++                    this.beginScoreGroup(view, gx, gy, tilesX, tilesY);
++                    const it = ranges(view)[Symbol.asyncIterator]();
++                    let next = it.next();
++                    for (;;) {
++                        const { value: range, done } = await next;
++                        if (done) break;
++                        next = it.next();
++                        const { count, rows, rowOffset = 0 } = range;
++                        if (!rows) {
++                            throw new Error('GpuSceneRasterizer: scoreStreamed needs each range to name its rows');
++                        }
++                        this.uploadRange(range);
++                        await this.rasterRange(count, tilesX, tilesY);
++                        const counted = (await scoreBuffer.read(0, count * 8, this.scoreReadback, true)) as Uint32Array;
++                        for (let i = 0; i < count; i++) {
++                            const lo = counted[i * 2];
++                            const hi = counted[i * 2 + 1];
++                            if (lo !== 0 || hi !== 0) {
++                                seen[rows[rowOffset + i]] += (hi * 2 ** 32 + lo) / SCORE_SCALE;
++                            }
++                        }
++                        // Clear the range's counters for the next range.
++                        scoreBuffer.write(0, this.scoreZeros, 0, count * 2);
++                    }
++                }
++                // A gaussian's contribution to the view is complete once every
++                // group has rasterized: fold it into the totals.
++                for (let i = 0; i < seen.length; i++) {
++                    const value = seen[i];
++                    if (value !== 0) {
++                        sum[i] += value;
++                        if (value > max[i]) max[i] = value;
++                        seen[i] = 0;
+                     }
+                 }
+             }
+@@ -665,14 +734,62 @@ class GpuSceneRasterizer {
+      * view and the largest single view, both in pixels.
+      */
+     async readScores(): Promise<Float32Array> {
+-        if (!this.scoreTotalsBuffer) {
+-            throw new Error('GpuSceneRasterizer: readScores needs a resident scene built with scoreScale');
+-        }
+         const out = new Float32Array(this.numSplats * 2);
+-        if (this.numSplats > 0) await this.scoreTotalsBuffer.read(0, this.numSplats * 8, out, true);
++        if (this.cpuScores) {
++            const { sum, max } = this.cpuScores;
++            for (let i = 0; i < this.numSplats; i++) {
++                out[i * 2] = sum[i];
++                out[i * 2 + 1] = max[i];
++            }
++        } else if (this.scoreTotalsBuffer) {
++            if (this.numSplats > 0) await this.scoreTotalsBuffer.read(0, this.numSplats * 8, out, true);
++        } else {
++            throw new Error('GpuSceneRasterizer: readScores needs a scene uploaded with the score option');
++        }
+         return out;
+     }
+ 
++    /** The image's groups (sub-frames), row by row, with each group's tile extent. */
++    private *groups(): Generator<{ gx: number; gy: number; tilesX: number; tilesY: number }> {
++        const o = this.options;
++        const imageTilesX = Math.ceil(o.imageWidth / TILE_SIZE);
++        const imageTilesY = Math.ceil(o.imageHeight / TILE_SIZE);
++        const numGroupsX = Math.ceil(imageTilesX / o.groupTilesX);
++        const numGroupsY = Math.ceil(imageTilesY / o.groupTilesY);
++        for (let gy = 0; gy < numGroupsY; gy++) {
++            for (let gx = 0; gx < numGroupsX; gx++) {
++                yield {
++                    gx,
++                    gy,
++                    tilesX: Math.min(o.groupTilesX, imageTilesX - gx * o.groupTilesX),
++                    tilesY: Math.min(o.groupTilesY, imageTilesY - gy * o.groupTilesY)
++                };
++            }
++        }
++    }
++
++    /** Scoring: set one group's uniforms and clear its running state (colour 0, transmittance 1). */
++    private beginScoreGroup(view: SceneView, gx: number, gy: number, tilesX: number, tilesY: number): void {
++        this.setUniforms(view, gx, gy, tilesX, tilesY, 0, 1);
++        const groupPixels = tilesX * tilesY * TILE_SIZE * TILE_SIZE;
++        this.clearStateCompute.setupDispatch(Math.ceil(groupPixels / (4 * 256)), 1, 1);
++        this.device.computeDispatch([this.clearStateCompute], 'scene-clear-state');
++    }
++
++    /**
++     * Scoring a streamed scene: CPU totals for `n` gaussians and the scratch
++     * for reading back and clearing one range's counters.
++     *
++     * @param n - Gaussians in the scene.
++     * @param rangeRows - Most gaussians per streamed range.
++     */
++    private allocateCpuScores(n: number, rangeRows: number): void {
++        if (!this.scoreRasterizeCompute) return;
++        this.cpuScores = { sum: new Float32Array(n), max: new Float32Array(n), view: new Float32Array(n) };
++        this.scoreReadback = new Uint32Array(rangeRows * 2);
++        this.scoreZeros = new Uint32Array(rangeRows * 2);
++    }
++
+     /**
+      * Render one view, or the mean of several, streaming the gaussians'
+      * records per pass. `ranges(view)` yields the view's visible gaussians
+@@ -1112,6 +1229,14 @@ class GpuSceneRasterizer {
+         const identity = new Uint32Array(rangeRows);
+         for (let i = 0; i < rangeRows; i++) identity[i] = i;
+         this.identityOrderBuffer.write(0, identity, 0, rangeRows);
++        if (this.scoreRasterizeCompute) {
++            // One range's counters; read back and cleared per range.
++            this.scoreBuffer = new StorageBuffer(
++                device,
++                Math.max(8, rangeRows * 8),
++                BUFFERUSAGE_COPY_SRC | BUFFERUSAGE_COPY_DST
++            );
++        }
+         this.allocateWorking(rangeRows);
+     }
+ 
+@@ -1263,6 +1388,8 @@ class GpuSceneRasterizer {
+         this.scoreBuffer?.destroy();
+         this.scoreTotalsBuffer?.destroy();
+         this.scoreBuffer = this.scoreTotalsBuffer = null;
++        this.cpuScores = null;
++        this.scoreReadback = this.scoreZeros = new Uint32Array(0);
+         this.positionBuffer?.destroy();
+         this.geometricBuffer?.destroy();
+         this.colorBuffer?.destroy();
+diff --git a/src/lib/gpu/shaders/rasterize-binned.ts b/src/lib/gpu/shaders/rasterize-binned.ts
+index e5603b9..b89f329 100644
+--- a/src/lib/gpu/shaders/rasterize-binned.ts
++++ b/src/lib/gpu/shaders/rasterize-binned.ts
+@@ -1,3 +1,5 @@
++import { SCORE_SCALE } from './score-resolve';
++
+ /**
+  * Binned rasterize shader. Each workgroup handles one tile and only walks
+  * the splats that have been pre-binned into it (tile-bin pre-pass on CPU
+@@ -17,16 +19,28 @@
+  * of the ±π longitude seam evaluates against the splat's nearer copy.
+  * Without the flag the raw delta is used.
+  *
+- * Scoring variant: with `scoreScale` set, every blend also adds its weight
+- * (`T × alpha`, in fixed point) to a per-gaussian counter indexed like
+- * `projected`, so one pass yields each gaussian's contribution to the view
+- * in pixels. The counter is a u32 because WGSL atomics are integers; the
+- * caller picks a scale that cannot overflow for the group's pixel count.
++ * Scoring variant: with `score` set, every blend also adds its weight
++ * (`T × alpha`, in fixed point at {@link SCORE_SCALE}) to a per-gaussian
++ * counter indexed like `projected`, so one pass yields each gaussian's
++ * contribution to the view in pixels. WGSL atomics are 32-bit integers, so
++ * a counter is two words: the low word takes the adds and an add that wraps
++ * it carries into the high word. `atomicAdd` returns the value it replaced,
++ * so exactly the adds that wrapped see it, and the pair is an exact 64-bit
++ * sum whatever the image size.
+  *
+- * @param scoreScale - Fixed-point scale of the per-gaussian counter; omit for the plain rasterizer.
++ * @param score - Count per-gaussian contributions; false for the plain rasterizer.
+  * @returns WGSL source for the binned-rasterize compute shader.
+  */
+-const rasterizeBinnedWgsl = (scoreScale?: number) => /* wgsl */ `
++const scoreAddWgsl = /* wgsl */ `
++        let scoreAdd = u32(weight * ${SCORE_SCALE.toFixed(1)} + 0.5);
++        if (scoreAdd > 0u) {
++            let scoreBefore = atomicAdd(&score[splatIdx * 2u], scoreAdd);
++            if (scoreBefore > 0xFFFFFFFFu - scoreAdd) {
++                atomicAdd(&score[splatIdx * 2u + 1u], 1u);
++            }
++        }`;
++
++const rasterizeBinnedWgsl = (score = false) => /* wgsl */ `
+ #include "uniformsStruct"
+ #include "constants"
+ 
+@@ -35,7 +49,7 @@ const rasterizeBinnedWgsl = (scoreScale?: number) => /* wgsl */ `
+ @group(0) @binding(2) var<storage, read_write> runningState: array<vec4<f32>>;
+ @group(0) @binding(3) var<storage, read> tileOffsets: array<u32>;
+ @group(0) @binding(4) var<storage, read> sortedSplatIndices: array<u32>;
+-${scoreScale ? '@group(0) @binding(5) var<storage, read_write> score: array<atomic<u32>>;' : ''}
++${score ? '@group(0) @binding(5) var<storage, read_write> score: array<atomic<u32>>;' : ''}
+ 
+ @compute @workgroup_size(TILE_SIZE, TILE_SIZE, 1)
+ fn main(
+@@ -113,7 +127,7 @@ fn main(
+         let alpha = min(OPACITY_CAP, v1.w * max(0.0, prof - GAUSSIAN_FLOOR));
+         if (alpha <= 0.0 || alpha < minAlpha) { continue; }
+         let weight = T * alpha;
+-        ${scoreScale ? `atomicAdd(&score[splatIdx], u32(weight * ${scoreScale.toFixed(1)} + 0.5));` : ''}
++${score ? scoreAddWgsl : ''}
+         let v2 = projected[splatIdx * 3u + 2u];
+         color = color + weight * v2.rgb;
+         T = T * (1.0 - alpha);
+diff --git a/src/lib/gpu/shaders/score-resolve.ts b/src/lib/gpu/shaders/score-resolve.ts
+index 6d63198..313dacb 100644
+--- a/src/lib/gpu/shaders/score-resolve.ts
++++ b/src/lib/gpu/shaders/score-resolve.ts
+@@ -1,14 +1,21 @@
++/**
++ * Fixed-point scale of the per-gaussian contribution counters: a blend of
++ * weight `w` adds `round(w × SCORE_SCALE)`. 2¹⁶ resolves weights to 1/131072,
++ * far below the faintest blend the rasterizer keeps.
++ */
++const SCORE_SCALE = 65536;
++
+ /**
+  * Folds one pass's per-gaussian contribution counters into the running
+  * totals. The rasterizer counts by depth rank (the index of its projection
+- * records); `order` maps a rank back to the gaussian's row. Per row the
+- * totals hold two floats: the sum of the contributions over all passes and
+- * the largest single pass. The counters are zeroed for the next pass.
++ * records) in two words per rank, low then high; `order` maps a rank back to
++ * the gaussian's row. Per row the totals hold two floats: the sum of the
++ * contributions over all passes and the largest single pass. The counters
++ * are zeroed for the next pass.
+  *
+- * @param scoreScale - Fixed-point scale the rasterizer counted with.
+  * @returns WGSL source for the score-resolve compute shader.
+  */
+-const scoreResolveWgsl = (scoreScale: number): string => /* wgsl */ `
++const scoreResolveWgsl = (): string => /* wgsl */ `
+ #include "uniformsStruct"
+ 
+ @group(0) @binding(0) var<uniform> uniforms: Uniforms;
+@@ -24,14 +31,16 @@ fn main(
+ ) {
+     let i = (wgId.y * numWg.x + wgId.x) * 64u + lid.x;
+     if (i >= uniforms.numSplats) { return; }
+-    let counted = score[i];
+-    if (counted == 0u) { return; }
+-    score[i] = 0u;
++    let lo = score[i * 2u];
++    let hi = score[i * 2u + 1u];
++    if ((lo | hi) == 0u) { return; }
++    score[i * 2u] = 0u;
++    score[i * 2u + 1u] = 0u;
+     let row = order[i];
+-    let value = f32(counted) / ${scoreScale.toFixed(1)};
++    let value = (f32(hi) * 4294967296.0 + f32(lo)) / ${SCORE_SCALE.toFixed(1)};
+     scoreTotals[row * 2u] = scoreTotals[row * 2u] + value;
+     scoreTotals[row * 2u + 1u] = max(scoreTotals[row * 2u + 1u], value);
+ }
+ `;
+ 
+-export { scoreResolveWgsl };
++export { SCORE_SCALE, scoreResolveWgsl };
+diff --git a/src/lib/index.ts b/src/lib/index.ts
+index c4355ed..d3c020f 100644
+--- a/src/lib/index.ts
++++ b/src/lib/index.ts
+@@ -45,6 +45,7 @@ export type {
+     FilterSphere,
+     FilterFloaters,
+     FilterCluster,
++    FilterViewScore,
+     Param as ProcessParam,
+     Stats,
+     Info,
+@@ -104,7 +105,7 @@ export type { WriteImageOptions, WriteVoxelOptions, VoxelMetadata } from './writ
+ // Camera animation tracks for multi-frame image output (editor project,
+ // viewer settings, or a plain frame list)
+ export { loadCameraTrack } from './render/camera-track';
+-export { computeViewScores } from './render/view-score';
++export { computeViewScores, viewScoreRows } from './render/view-score';
+ export type { ViewScoreCamera, ViewScoreOptions, ViewScores } from './render/view-score';
+ export type { CameraTrack, TrackPose } from './render/camera-track';
+ 
+diff --git a/src/lib/process-source.ts b/src/lib/process-source.ts
+index 5470899..2a8c8ba 100644
+--- a/src/lib/process-source.ts
++++ b/src/lib/process-source.ts
+@@ -16,13 +16,15 @@ import {
+ } from './ops';
+ import { processDataTable } from './process';
+ import type { ProcessAction, ProcessOptions } from './process';
++import { viewScoreRows } from './render/view-score';
+ import { formatSourceInfo, formatSourceStats } from './source-info';
+-import { logger, Transform } from './utils';
++import { fmtCount, logger, Transform } from './utils';
+ import { withBlindOrigins } from './utils/sog-blind';
+ 
+ /**
+  * The `ProcessAction` kinds `processSource` can apply natively on the streaming
+- * chunk path. Anything else (decimate, the GPU voxel filters) is applied by
++ * chunk path (`filterViewScore` among them: it renders the source directly).
++ * Anything else (decimate, the GPU voxel filters) is applied by
+  * {@link processSourceBridged} as a `processDataTable` island.
+  */
+ const SOURCE_ACTION_KINDS: ReadonlySet<ProcessAction['kind']> = new Set([
+@@ -34,6 +36,7 @@ const SOURCE_ACTION_KINDS: ReadonlySet<ProcessAction['kind']> = new Set([
+     'filterBox',
+     'filterSphere',
+     'filterBands',
++    'filterViewScore',
+     'mortonOrder',
+     'stats',
+     'info',
+@@ -92,6 +95,29 @@ const processSource = async (
+             case 'filterBands':
+                 src = reduceBandsSource(src, action.value, pool);
+                 break;
++            case 'filterViewScore': {
++                if (!options?.createDevice) {
++                    throw new Error('filterViewScore requires a createDevice function (GPU rasterization)');
++                }
++                if (src.meta.numLods > 1) {
++                    throw new Error('filterViewScore: score one LOD at a time — select a single LOD first');
++                }
++                // Scores come from rendering the source as it is (its pending
++                // transform is honoured by moving the cameras), so nothing is
++                // baked or materialized: the scene is uploaded to the GPU, or
++                // streamed through it when it does not fit.
++                const g = logger.group('Filter view score');
++                const before = src.meta.lodCounts[0];
++                const rows = await viewScoreRows(await options.createDevice(), src, pool, action.cameras, action);
++                logger.info(
++                    rows.length < before
++                        ? `removed ${fmtCount(before - rows.length)} gaussians (${action.cameras.length} view${action.cameras.length === 1 ? '' : 's'})`
++                        : 'no change'
++                );
++                g.end();
++                if (rows.length < before) src = filterSource(src, rows, pool);
++                break;
++            }
+             case 'mortonOrder': {
+                 // Compute a Morton (Z-order) permutation from the raw (unbaked)
+                 // positions and apply it as a lazy gather view — the chunk-native
+diff --git a/src/lib/process.ts b/src/lib/process.ts
+index 3e3cf7c..f26e570 100644
+--- a/src/lib/process.ts
++++ b/src/lib/process.ts
+@@ -7,6 +7,8 @@ import type { Row } from './data-table';
+ import { decimateSource } from './decimate-uniform';
+ import { computeSourceStats } from './ops';
+ import type { InputFormat } from './read';
++import { viewScoreRows } from './render/view-score';
++import type { ViewScoreCamera } from './render/view-score';
+ import { formatSourceInfo, formatSourceStats } from './source-info';
+ import type { DeviceCreator } from './types';
+ import { fmtCount, logger, Transform } from './utils';
+@@ -211,11 +213,37 @@ type FilterCluster = {
+     minContribution?: number;
+ };
+ 
++/**
++ * Remove Gaussians that contribute too little to a set of views.
++ *
++ * Renders the scene from each camera on the GPU and totals, per Gaussian, the
++ * pixels it effectively paints (the sum of its blending weights). A Gaussian
++ * is kept when its best view exceeds `minPixels`. With the default of 0 only
++ * Gaussians that are hidden, out of view or too faint to register in every
++ * view are removed, so the scored views do not change.
++ */
++type FilterViewScore = {
++    /** Action type identifier. */
++    kind: 'filterViewScore';
++    /** The views to keep the scene for, in the PlayCanvas default space. */
++    cameras: ViewScoreCamera[];
++    /** Pixels a Gaussian must exceed in its best view to be kept. Default: 0 */
++    minPixels?: number;
++    /** Width of the scoring image in pixels. Default: 640 */
++    width?: number;
++    /** Height of the scoring image in pixels. Default: 360 */
++    height?: number;
++    /** Vertical field of view in degrees for cameras without their own. Default: 60 */
++    fov?: number;
++    /** Near clip distance in world units. Default: 0.2 */
++    near?: number;
++};
++
+ /**
+  * Options for processing actions that require external resources.
+  */
+ type ProcessOptions = {
+-    /** Function to create a GPU device (required for filterFloaters, filterCluster). */
++    /** Function to create a GPU device (required for filterFloaters, filterCluster, filterViewScore). */
+     createDevice?: DeviceCreator;
+     /** Input format reported by the `info`/`stats` actions; omitted when unset. */
+     sourceFormat?: InputFormat;
+@@ -235,6 +263,7 @@ type ProcessOptions = {
+  * - `filterSphere` - Keep splats within a sphere
+  * - `filterFloaters` - Remove splats not contributing to any occupied voxel (GPU)
+  * - `filterCluster` - Keep splats in the connected cluster at a seed position (GPU)
++ * - `filterViewScore` - Remove splats that contribute too little to a set of views (GPU)
+  * - `stats` - Print per-LOD, per-column statistics to logger
+  * - `info` - Print structural metadata to logger
+  * - `mortonOrder` - Reorder splats by Morton code for spatial locality
+@@ -251,6 +280,7 @@ type ProcessAction =
+     | FilterSphere
+     | FilterFloaters
+     | FilterCluster
++    | FilterViewScore
+     | Param
+     | Stats
+     | Info
+@@ -615,6 +645,23 @@ const processDataTable = async (
+                 );
+                 break;
+             }
++            case 'filterViewScore': {
++                if (!options?.createDevice) {
++                    throw new Error('filterViewScore requires a createDevice function (GPU rasterization)');
++                }
++                const g = logger.group('Filter view score');
++                const rows = await viewScoreRows(
++                    await options.createDevice(),
++                    dataTableToChunkSource(result),
++                    createChunkDataPool(),
++                    processAction.cameras,
++                    processAction
++                );
++                const next = rows.length === result.numRows ? result : result.clone({ rows });
++                endFilterGroup(g, result, next);
++                result = next;
++                break;
++            }
+         }
+     }
+ 
+@@ -635,6 +682,7 @@ export {
+     type FilterSphere,
+     type FilterFloaters,
+     type FilterCluster,
++    type FilterViewScore,
+     type Param,
+     type Stats,
+     type Info,
+diff --git a/src/lib/render/index.ts b/src/lib/render/index.ts
+index 314e261..81af999 100644
+--- a/src/lib/render/index.ts
++++ b/src/lib/render/index.ts
+@@ -7,4 +7,10 @@ export {
+     type SceneTier
+ } from './scene-renderer';
+ export { loadCameraTrack, type CameraTrack, type TrackPose } from './camera-track';
+-export { computeViewScores, type ViewScoreCamera, type ViewScoreOptions, type ViewScores } from './view-score';
++export {
++    computeViewScores,
++    viewScoreRows,
++    type ViewScoreCamera,
++    type ViewScoreOptions,
++    type ViewScores
++} from './view-score';
+diff --git a/src/lib/render/scene-renderer.ts b/src/lib/render/scene-renderer.ts
+index 6344b05..aba9839 100644
+--- a/src/lib/render/scene-renderer.ts
++++ b/src/lib/render/scene-renderer.ts
+@@ -63,7 +63,7 @@ type SceneRendererOptions = {
+     compensation?: boolean;
+     /** Screen-space filter, in pixels², of scenes trained with anti-aliasing; default `AA_FILTER_COV` (0.1). */
+     antiAliasFilterSize?: number;
+-    /** Allow {@link SceneRenderer.accumulateScores}; resident tier only. Default false. */
++    /** Allow {@link SceneRenderer.accumulateScores}. Default false. */
+     score?: boolean;
+ };
+ 
+@@ -149,10 +149,6 @@ class SceneRenderer {
+             );
+         }
+         const bg = options.background;
+-        // Largest counter scale that cannot overflow a u32 when one gaussian
+-        // covers a whole group at full weight; 2¹⁶ resolves weights to 1/131072.
+-        const groupPixels = groupTilesX * groupTilesY * TILE_SIZE * TILE_SIZE;
+-        const scoreScale = Math.max(1, Math.min(65536, Math.floor((2 ** 32 - 1) / (groupPixels + 1))));
+         this.raster = new GpuSceneRasterizer(device, {
+             numSHBands: this.numSHBands,
+             projection: options.projection,
+@@ -168,7 +164,7 @@ class SceneRenderer {
+             bgG: bg.g,
+             bgB: bg.b,
+             bgA: bg.a,
+-            scoreScale: options.score ? scoreScale : undefined
++            score: options.score
+         });
+     }
+ 
+@@ -182,15 +178,18 @@ class SceneRenderer {
+         const { device, source, pool, options, numSplats: n, numSHBands: bands } = this;
+         const budget = options.residentBudget ?? Infinity;
+         const forced = options.tier;
+-        const rangeBytes = this.rangeRows * (12 + 32 + colorStride(bands) + WORKING_BYTES + 4);
++        // Scoring adds the counters (8 B a row) and, when resident, the totals (8 B a row).
++        const scoreBytes = options.score ? 8 : 0;
++        const rangeBytes = this.rangeRows * (12 + 32 + colorStride(bands) + WORKING_BYTES + 4 + scoreBytes);
++        const residentBytes = residentSceneBytes(n, bands) + n * scoreBytes * 2;
+ 
+         if (
+             forced === 'resident' ||
+-            (forced === undefined && residentSceneFits(device, n, bands) && residentSceneBytes(n, bands) <= budget)
++            (forced === undefined && residentSceneFits(device, n, bands) && residentBytes <= budget)
+         ) {
+             try {
+                 await this.raster.uploadScene(source, pool);
+-                return this.chose('resident', residentSceneBytes(n, bands));
++                return this.chose('resident', residentBytes);
+             } catch (e) {
+                 if (forced || !(e instanceof ResidentUploadError)) throw e;
+             }
+@@ -253,15 +252,24 @@ class SceneRenderer {
+      * Add each gaussian's contribution to the given views to the scene's
+      * score totals, without producing images: per view, the sum over pixels
+      * of the gaussian's blending weight (transmittance × alpha). Needs the
+-     * `score` option and the resident tier.
++     * `score` option. Works in every tier; the streamed ones gather the
++     * scene from the source once per view, as rendering does.
+      *
+      * @param cameras - The views to score; same constraints as {@link render}.
+      */
+     async accumulateScores(cameras: RenderCamera[]): Promise<void> {
+-        if (this.tier !== 'resident') {
+-            throw new Error('SceneRenderer: scoring needs the resident tier');
++        if (!this.tier) {
++            throw new Error('SceneRenderer: upload before accumulateScores');
++        }
++        if (!this.options.score) {
++            throw new Error('SceneRenderer: accumulateScores needs the score option');
++        }
++        const views = this.views(cameras);
++        if (this.tier === 'resident') {
++            await this.raster.score(views);
++        } else {
++            await this.raster.scoreStreamed(views, (view) => this.ranges(view));
+         }
+-        await this.raster.score(this.views(cameras));
+     }
+ 
+     /**
+@@ -306,7 +314,7 @@ class SceneRenderer {
+             const geometric = this.pool.acquire('geometric', layouts.geometric!, count);
+             const color = this.pool.acquire('color', layouts.color!, count);
+             await this.source.read({ indices: order, indexOffset: base, count, lod: 0, position, geometric, color });
+-            yield { count, position, geometric, color };
++            yield { count, position, geometric, color, rows: order, rowOffset: base };
+         }
+     }
+ 
+diff --git a/src/lib/render/view-score.ts b/src/lib/render/view-score.ts
+index 31e568a..d07f6fa 100644
+--- a/src/lib/render/view-score.ts
++++ b/src/lib/render/view-score.ts
+@@ -7,6 +7,7 @@ import { Transform } from '../utils';
+ 
+ import type { RenderCamera } from './camera';
+ import { SceneRenderer } from './scene-renderer';
++import type { SceneTier } from './scene-renderer';
+ 
+ type Vec3Like = { x: number; y: number; z: number };
+ 
+@@ -31,6 +32,10 @@ type ViewScoreOptions = {
+     fov?: number;
+     /** Near clip distance in world units; default 0.2. */
+     near?: number;
++    /** Most GPU bytes the scene may hold; larger scenes are streamed from the source per view. Default: unlimited. */
++    residentBudget?: number;
++    /** Hold the scene in this tier regardless of fit (tests); default picks the first that fits. */
++    tier?: SceneTier;
+     /** Called after each view with the number of views done. */
+     onProgress?: (done: number, total: number) => void;
+ };
+@@ -45,6 +50,8 @@ type ViewScores = {
+     views: number;
+     /** Pixels per scoring image, for normalizing. */
+     pixels: number;
++    /** How the scene was held while scoring. */
++    tier: SceneTier;
+ };
+ 
+ /**
+@@ -54,9 +61,14 @@ type ViewScores = {
+  * effectively paints. Gaussians that are behind the camera, outside the
+  * frustum, hidden behind opaque geometry or too faint to register score 0.
+  *
+- * The scene is held resident on the GPU, so it must fit the device (see
+- * `residentSceneFits`). Only LOD 0 is scored; view a multi-LOD source through
+- * `selectLod` first. The source's pending transform is honoured.
++ * The scores are in pixels of the scoring image, so they scale with its
++ * size; compare them against `pixels`, or keep the size fixed.
++ *
++ * A scene that fits the device is held resident on the GPU and costs one
++ * render pass per view. A larger one is streamed from the source per view,
++ * which is slow: seconds per view for tens of millions of gaussians. Only
++ * LOD 0 is scored; view a multi-LOD source through `selectLod` first. The
++ * source's pending transform is honoured.
+  *
+  * @param device - WebGPU graphics device.
+  * @param source - The scene.
+@@ -81,6 +93,18 @@ const computeViewScores = async (
+     const height = options.height ?? 360;
+     const defaultFov = options.fov ?? 60;
+     let near = options.near ?? 0.2;
++    if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
++        throw new Error(`computeViewScores: invalid image size ${width}x${height}`);
++    }
++    if (!(near > 0)) {
++        throw new Error(`computeViewScores: near must be positive, got ${near}`);
++    }
++    for (const c of cameras) {
++        const fov = c.fov ?? defaultFov;
++        if (!(fov > 0 && fov < 180)) {
++            throw new Error(`computeViewScores: invalid fov ${fov}°. Must be in (0, 180).`);
++        }
++    }
+ 
+     // Cameras live in the PlayCanvas default space, the scene in its source
+     // space: move the cameras into the scene's rather than baking the scene.
+@@ -103,11 +127,12 @@ const computeViewScores = async (
+         width,
+         height,
+         background: { r: 0, g: 0, b: 0, a: 0 },
+-        tier: 'resident',
++        residentBudget: options.residentBudget,
++        tier: options.tier,
+         score: true
+     });
+     try {
+-        await scene.upload();
++        const tier = await scene.upload();
+         for (let i = 0; i < cameras.length; i++) {
+             const c = cameras[i];
+             const camera: RenderCamera = {
+@@ -131,10 +156,47 @@ const computeViewScores = async (
+             sum[i] = totals[i * 2];
+             max[i] = totals[i * 2 + 1];
+         }
+-        return { sum, max, views: cameras.length, pixels: width * height };
++        return { sum, max, views: cameras.length, pixels: width * height, tier };
+     } finally {
+         scene.destroy();
+     }
+ };
+ 
+-export { computeViewScores, type ViewScoreCamera, type ViewScoreOptions, type ViewScores };
++/**
++ * The rows of a scene worth keeping for a set of views: those whose
++ * contribution to their best view exceeds `minPixels`. With the default of 0
++ * only gaussians that contribute to no view at all are dropped, which leaves
++ * every scored view unchanged; a higher threshold also drops faint and tiny
++ * gaussians and changes the views slightly.
++ *
++ * @param device - WebGPU graphics device.
++ * @param source - The scene (its LOD 0).
++ * @param pool - Pool for the chunk read buffers.
++ * @param cameras - The viewpoints.
++ * @param options - Scoring options and the `minPixels` threshold.
++ * @returns Ascending row indices to keep.
++ */
++const viewScoreRows = async (
++    device: GraphicsDevice,
++    source: ChunkSource,
++    pool: ChunkDataPool,
++    cameras: ViewScoreCamera[],
++    options: ViewScoreOptions & { minPixels?: number } = {}
++): Promise<Uint32Array> => {
++    const minPixels = options.minPixels ?? 0;
++    if (!Number.isFinite(minPixels) || minPixels < 0) {
++        throw new Error(`filterViewScore: minPixels must be a non-negative finite number, got ${minPixels}`);
++    }
++    if (cameras.length === 0) {
++        throw new Error('filterViewScore: at least one camera is required');
++    }
++    const { max } = await computeViewScores(device, source, pool, cameras, options);
++    const rows = new Uint32Array(max.length);
++    let kept = 0;
++    for (let i = 0; i < max.length; i++) {
++        if (max[i] > minPixels) rows[kept++] = i;
++    }
++    return rows.slice(0, kept);
++};
++
++export { computeViewScores, viewScoreRows, type ViewScoreCamera, type ViewScoreOptions, type ViewScores };
+diff --git a/test/cli.test.mjs b/test/cli.test.mjs
+index 549207c..8c75f01 100644
+--- a/test/cli.test.mjs
++++ b/test/cli.test.mjs
+@@ -529,3 +529,74 @@ describe('CLI combining opacity_linear', () => {
+         });
+     }
+ });
++
++describe('CLI filter-view-score', () => {
++    // A flat 20 × 20 grid on y = 0 spanning ±10; the camera of the render goldens.
++    const scene = ['test/fixtures/generator.mjs', '-p', 'width=20,height=20,spacing=1.0,scale=0.1'];
++    const hasGpu = async () => {
++        const { enumerateAdapters } = await import('../src/cli/node-device.ts');
++        return (await enumerateAdapters()).length > 0;
++    };
++    const vertexCount = async (path) => {
++        const header = (await readFile(path)).subarray(0, 512).toString('latin1');
++        return Number(header.match(/element vertex (\d+)\n/)[1]);
++    };
++
++    it('needs a camera', async () => {
++        const result = await runCli([...scene, '--filter-view-score', 'null']);
++        assert.notStrictEqual(result.code, 0);
++        assert.match(result.stderr + result.stdout, /--filter-view-score needs the views to score from/);
++    });
++
++    it('rejects a negative threshold and an empty view budget', async () => {
++        const camera = ['--camera-pos', '0,5,-8'];
++        let result = await runCli([...camera, ...scene, '--filter-view-score=-1', 'null']);
++        assert.match(result.stderr + result.stdout, /Invalid filter-view-score threshold/);
++        result = await runCli([...camera, ...scene, '--filter-view-score', '0,0', 'null']);
++        assert.match(result.stderr + result.stdout, /Invalid filter-view-score view count/);
++    });
++
++    it('keeps what a static camera sees', async (t) => {
++        if (!(await hasGpu())) return t.skip('no WebGPU adapter available');
++        const dir = await mkdtemp(join(tmpdir(), 'st-view-score-cli-'));
++        try {
++            const outPath = join(dir, 'out.ply');
++            const result = await runCli([
++                '--camera-pos', '0,5,-8', '--camera-target', '0,0,0', '--resolution', '320x240',
++                ...scene, '--filter-view-score', outPath
++            ]);
++            assert.strictEqual(result.code, 0, `CLI failed:\n${result.stderr}\n${result.stdout}`);
++            const kept = await vertexCount(outPath);
++            // The rows behind the camera and the corners outside its frustum go.
++            assert.ok(kept > 0 && kept < 400, `kept ${kept} of 400`);
++        } finally {
++            await rm(dir, { recursive: true, force: true });
++        }
++    });
++
++    it('keeps more for a camera track than for one of its frames', async (t) => {
++        if (!(await hasGpu())) return t.skip('no WebGPU adapter available');
++        const dir = await mkdtemp(join(tmpdir(), 'st-view-score-cli-'));
++        try {
++            // Two cameras on opposite sides of the grid: together they see more than either.
++            const track = join(dir, 'track.json');
++            await writeFile(track, JSON.stringify({
++                frames: [{ position: [0, 5, -8], target: [0, 0, 0] }, { position: [0, 5, 8], target: [0, 0, 0] }]
++            }));
++            const run = async (name, extra) => {
++                const outPath = join(dir, name);
++                const result = await runCli([
++                    '--camera-track', track, '--resolution', '320x240', ...extra,
++                    ...scene, '--filter-view-score', outPath
++                ]);
++                assert.strictEqual(result.code, 0, `CLI failed:\n${result.stderr}\n${result.stdout}`);
++                return vertexCount(outPath);
++            };
++            const both = await run('both.ply', []);
++            const first = await run('first.ply', ['--frames', '0']);
++            assert.ok(first > 0 && first < both, `one frame keeps ${first}, both keep ${both}`);
++        } finally {
++            await rm(dir, { recursive: true, force: true });
++        }
++    });
++});
+diff --git a/test/view-score.test.mjs b/test/view-score.test.mjs
+index 1f33a31..3d834aa 100644
+--- a/test/view-score.test.mjs
++++ b/test/view-score.test.mjs
+@@ -191,7 +191,7 @@ describe('computeViewScores', () => {
+         const score = async (groupTilesX, groupTilesY) => {
+             const raster = new GpuSceneRasterizer(device, {
+                 numSHBands: 0, projection: 'pinhole', imageWidth: size.width, imageHeight: size.height,
+-                groupTilesX, groupTilesY, bgR: 0, bgG: 0, bgB: 0, bgA: 0, scoreScale: 4096
++                groupTilesX, groupTilesY, bgR: 0, bgG: 0, bgB: 0, bgA: 0, score: true
+             });
+             await raster.uploadScene(scene.source, scene.pool);
+             await raster.score([view]);
+@@ -205,4 +205,167 @@ describe('computeViewScores', () => {
+             assert.ok(Math.abs(whole[i * 2] - split[i * 2]) <= 0.01 + 0.01 * whole[i * 2], `row ${i}: ${whole[i * 2]} vs ${split[i * 2]}`);
+         }
+     });
++
++    it('scores the same in the streamed tiers', async (t) => {
++        if (!device) return t.skip('no WebGPU device');
++        const { computeViewScores } = await import('../src/lib/index.js');
++        const back = { position: { x: 0, y: 0, z: -6 }, target: { x: 0, y: 0, z: 0 } };
++        const side = { position: { x: 7, y: 2, z: 3 }, target: { x: 0, y: 0, z: 0 } };
++        const cameras = [camera, back, side];
++        const score = async (tier) => {
++            const scene = await makeScene();
++            const scores = await computeViewScores(device, scene.source, scene.pool, cameras, { ...size, tier });
++            assert.strictEqual(scores.tier, tier);
++            return { scores, scene };
++        };
++        const { scores: resident, scene } = await score('resident');
++        // The chunk size (1024) is below the scene's 1781 gaussians, so the
++        // streamed tiers cross a range boundary within each view.
++        for (const tier of ['streamed-gpu', 'streamed-cpu']) {
++            const { scores } = await score(tier);
++            for (let i = 0; i < scene.n; i++) {
++                for (const key of ['sum', 'max']) {
++                    const a = resident[key][i], b = scores[key][i];
++                    assert.ok(Math.abs(a - b) <= 0.01 + 0.01 * a, `${tier} ${key} row ${i}: ${b} vs ${a}`);
++                }
++            }
++        }
++    });
++
++    it('counts past 32 bits for a gaussian that fills a large image', async (t) => {
++        if (!device) return t.skip('no WebGPU device');
++        const { Column, DataTable, dataTableToChunkSource, computeViewScores } = await import('../src/lib/index.js');
++        const { createChunkDataPool } = await import('../src/lib/chunk/index.js');
++        // One opaque gaussian far wider than the view: every pixel blends it at
++        // nearly full weight, so its counter passes 2^32 (65536 pixels at scale 2^16)
++        // and must carry into the high word.
++        const col = v => new Float32Array([v]);
++        const dataTable = new DataTable([
++            new Column('x', col(0)), new Column('y', col(0)), new Column('z', col(0)),
++            new Column('rot_0', col(1)), new Column('rot_1', col(0)), new Column('rot_2', col(0)), new Column('rot_3', col(0)),
++            new Column('scale_0', col(Math.log(50))), new Column('scale_1', col(Math.log(50))), new Column('scale_2', col(Math.log(0.01))),
++            new Column('opacity', col(logit(0.999))),
++            new Column('f_dc_0', col(1)), new Column('f_dc_1', col(1)), new Column('f_dc_2', col(1))
++        ]);
++        const big = { width: 512, height: 512 };
++        const source = dataTableToChunkSource(dataTable, 1024);
++        const pool = createChunkDataPool({ chunkSize: 1024 });
++        const scores = await computeViewScores(device, source, pool, [camera], big);
++
++        // The renderer clamps a frame-filling gaussian's footprint, so it does
++        // not paint the whole image; the image's own coverage is the reference.
++        const { SceneRenderer } = await import('../src/lib/render/index.js');
++        const { Vec3 } = await import('playcanvas');
++        const renderer = new SceneRenderer(device, source, pool, {
++            projection: 'pinhole', ...big, background: { r: 0, g: 0, b: 0, a: 0 }, tier: 'resident'
++        });
++        await renderer.upload();
++        const image = await renderer.render({
++            position: new Vec3(0, 0, 6), target: new Vec3(0, 0, 0), up: new Vec3(0, 1, 0),
++            fovY: 60 * Math.PI / 180, ...big, near: 0.2
++        });
++        renderer.destroy();
++        let coverage = 0;
++        for (let i = 3; i < image.length; i += 4) coverage += image[i] / 255;
++
++        assert.ok(scores.sum[0] > 65536, `the low word wrapped (${scores.sum[0]} pixels)`);
++        assert.ok(Math.abs(scores.sum[0] - coverage) / coverage < 0.001, `score ${scores.sum[0]} vs coverage ${coverage}`);
++    });
++
++    it('rejects invalid options', async (t) => {
++        if (!device) return t.skip('no WebGPU device');
++        const { computeViewScores } = await import('../src/lib/index.js');
++        const scene = await makeScene();
++        const run = options => computeViewScores(device, scene.source, scene.pool, [camera], options);
++        await assert.rejects(run({ width: 0 }), /invalid image size/);
++        await assert.rejects(run({ near: 0 }), /near must be positive/);
++        await assert.rejects(run({ fov: 180 }), /invalid fov/);
++    });
++});
++
++describe('filterViewScore', () => {
++    const createDevice = () => Promise.resolve(device);
++    const action = { kind: 'filterViewScore', cameras: [camera], ...size };
++
++    // Rows of the makeScene groups that the front camera cannot see.
++    const unseen = scene => ['hidden', 'behindCamera', 'outside'].reduce((n, g) => n + scene.groups[g][1] - scene.groups[g][0], 0);
++
++    it('drops unseen gaussians from a source and leaves the view unchanged', async (t) => {
++        if (!device) return t.skip('no WebGPU device');
++        const { processSourceBridged, materializeToDataTable } = await import('../src/lib/index.js');
++        const { SceneRenderer } = await import('../src/lib/render/index.js');
++        const { Vec3 } = await import('playcanvas');
++        const scene = await makeScene();
++        const render = async (source) => {
++            const renderer = new SceneRenderer(device, source, scene.pool, {
++                projection: 'pinhole', ...size, background: { r: 0, g: 0, b: 0, a: 1 }, tier: 'resident'
++            });
++            await renderer.upload();
++            const image = await renderer.render({
++                position: new Vec3(0, 0, 6), target: new Vec3(0, 0, 0), up: new Vec3(0, 1, 0),
++                fovY: 60 * Math.PI / 180, ...size, near: 0.2
++            });
++            renderer.destroy();
++            return image;
++        };
++        const before = await render(scene.source);
++        const filtered = await processSourceBridged(scene.source, [action], scene.pool, { createDevice });
++        const kept = filtered.meta.lodCounts[0];
++        // Everything the camera cannot see goes; so do wall gaussians outside its frustum.
++        assert.ok(kept <= scene.n - unseen(scene), `kept ${kept} of ${scene.n}`);
++        assert.ok(kept >= scene.groups.front[1] - scene.groups.front[0]);
++        const after = await render(filtered);
++        assert.deepStrictEqual(after, before, 'removing zero-score gaussians leaves the scored view byte-identical');
++
++        // The filtered source reads back as a consistent table.
++        const table = await materializeToDataTable(filtered, scene.pool);
++        assert.strictEqual(table.numRows, kept);
++    });
++
++    it('matches on the DataTable path', async (t) => {
++        if (!device) return t.skip('no WebGPU device');
++        const { processSourceBridged, processDataTable, materializeToDataTable } = await import('../src/lib/index.js');
++        const a = await makeScene();
++        const b = await makeScene();
++        const viaSource = await processSourceBridged(a.source, [action], a.pool, { createDevice });
++        const table = await processDataTable(await materializeToDataTable(b.source, b.pool), [action], { createDevice });
++        assert.strictEqual(table.numRows, viaSource.meta.lodCounts[0]);
++    });
++
++    it('removes more with a higher threshold', async (t) => {
++        if (!device) return t.skip('no WebGPU device');
++        const { processSourceBridged } = await import('../src/lib/index.js');
++        const count = async (minPixels) => {
++            const scene = await makeScene();
++            const out = await processSourceBridged(scene.source, [{ ...action, minPixels }], scene.pool, { createDevice });
++            return out.meta.lodCounts[0];
++        };
++        const none = await count(0);
++        const some = await count(5);
++        const all = await count(1e9);
++        assert.ok(some < none, `${some} < ${none}`);
++        assert.strictEqual(all, 0);
++    });
++
++    it('needs a device and valid parameters', async () => {
++        const { processSourceBridged, processDataTable, materializeToDataTable } = await import('../src/lib/index.js');
++        const scene = await makeScene();
++        await assert.rejects(
++            processSourceBridged(scene.source, [action], scene.pool),
++            /filterViewScore requires a createDevice function/
++        );
++        await assert.rejects(
++            processDataTable(await materializeToDataTable(scene.source, scene.pool), [action]),
++            /filterViewScore requires a createDevice function/
++        );
++        if (!device) return;
++        await assert.rejects(
++            processSourceBridged(scene.source, [{ ...action, minPixels: -1 }], scene.pool, { createDevice }),
++            /minPixels must be a non-negative finite number/
++        );
++        await assert.rejects(
++            processSourceBridged(scene.source, [{ ...action, cameras: [] }], scene.pool, { createDevice }),
++            /at least one camera is required/
++        );
++    });
+ });
+-- 
+2.43.0
+
